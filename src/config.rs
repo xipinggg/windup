@@ -11,6 +11,7 @@ use crate::batch::{BatchProcessor, FlushInfo};
 use crate::controller::WindowController;
 use crate::error::AccumulatorError;
 use crate::metrics::MetricsCollector;
+use crate::stats::AccumulatorStats;
 
 /// 并发模式配置。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,8 @@ pub struct AccumulatorConfig {
     pub(crate) max_queue_depth: Option<usize>,
     pub(crate) flush_empty_batches: bool,
     pub(crate) concurrency_mode: ConcurrencyMode,
+    pub(crate) stats_enabled: bool,
+    pub(crate) max_batch_weight: Option<usize>,
 }
 
 impl AccumulatorConfig {
@@ -75,6 +78,8 @@ impl AccumulatorConfig {
             max_queue_depth: None,
             flush_empty_batches: false,
             concurrency_mode: ConcurrencyMode::Serial,
+            stats_enabled: false,
+            max_batch_weight: None,
         })
     }
 
@@ -103,9 +108,25 @@ impl AccumulatorConfig {
         self
     }
 
-    /// 消费配置，构建 [`AccumulatorHandle`] 和 [`BatchAccumulator`]。
+    /// 开启或关闭可观测性统计。默认关闭。
     ///
-    /// item 类型 `T` 和结果类型 `R` 从 `processor: P` 自动推断。
+    /// 开启后可通过 [`AccumulatorHandle::stats`] 获取运行统计快照。
+    pub fn with_stats(mut self, enabled: bool) -> Self {
+        self.stats_enabled = enabled;
+        self
+    }
+
+    /// 设置最大批次权重。总权重达到此值时提前 flush。
+    ///
+    /// 需要配合 [`build_with_weight`](Self::build_with_weight) 传入权重函数。
+    pub fn with_max_batch_weight(mut self, n: usize) -> Self {
+        self.max_batch_weight = Some(n);
+        self
+    }
+
+    /// 消费配置，构建 [`AccumulatorHandle`] 和 [`BatchAccumulator`]（无权重追踪）。
+    ///
+    /// 等价于 `build_with_weight(processor, metrics, controller, |_| 1)`。
     #[allow(clippy::type_complexity)]
     pub fn build<T, R, P, M, C>(
         self,
@@ -120,12 +141,35 @@ impl AccumulatorConfig {
         M: MetricsCollector,
         C: WindowController,
     {
+        self.build_with_weight(processor, metrics, controller, |_| 1)
+    }
+
+    /// 消费配置，构建 [`AccumulatorHandle`] 和 [`BatchAccumulator`]，传入权重函数。
+    ///
+    /// item 类型 `T` 和结果类型 `R` 从 `processor: P` 自动推断。
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity)]
+    pub fn build_with_weight<T, R, P, M, C>(
+        self,
+        processor: P,
+        metrics: M,
+        controller: C,
+        weight_fn: impl Fn(&T) -> usize + Send + Sync + 'static,
+    ) -> (AccumulatorHandle<T, R>, BatchAccumulator<T, R, P, M, C>)
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+        P: BatchProcessor<T, R>,
+        M: MetricsCollector,
+        C: WindowController,
+    {
         let (tx, rx) = mpsc::unbounded_channel();
         let (bypass_tx, bypass_rx) = mpsc::unbounded_channel();
         let (feedback_tx, feedback_rx) = mpsc::unbounded_channel::<FlushInfo>();
         let pending_count = Arc::new(AtomicUsize::new(0));
         let inflight_count = Arc::new(AtomicUsize::new(0));
         let flush_notify = Arc::new(Notify::new());
+        let stats = Arc::new(AccumulatorStats::new());
 
         let handle = AccumulatorHandle {
             sender: tx,
@@ -133,6 +177,7 @@ impl AccumulatorConfig {
             pending_count: Arc::clone(&pending_count),
             max_queue_depth: self.max_queue_depth,
             flush_notify: Arc::clone(&flush_notify),
+            stats: Arc::clone(&stats),
         };
 
         let current_window = self.initial_window;
@@ -145,7 +190,7 @@ impl AccumulatorConfig {
             item_rx: rx,
             bypass_rx,
             flush_notify,
-            buffer: Vec::new(),
+            buffer: std::collections::VecDeque::new(),
             current_window,
             next_batch_id: 0,
             last_flush_time: tokio::time::Instant::now(),
@@ -154,6 +199,9 @@ impl AccumulatorConfig {
             feedback_tx,
             inflight: JoinSet::new(),
             inflight_count,
+            stats,
+            weight_fn: Arc::new(weight_fn),
+            current_weight: 0,
         };
 
         (handle, accumulator)
@@ -170,6 +218,8 @@ impl Default for AccumulatorConfig {
             max_queue_depth: None,
             flush_empty_batches: false,
             concurrency_mode: ConcurrencyMode::Serial,
+            stats_enabled: false,
+            max_batch_weight: None,
         }
     }
 }

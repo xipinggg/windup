@@ -81,14 +81,16 @@ impl<T> Batch<T> {
 ///
 /// `.await` 后得到对应 item 的处理结果。
 ///
-/// 如果累加器在结果返回前关闭， `.await` 返回 `Err(AccumulatorError::Shutdown)`。
+/// 可能返回的错误：
+/// - [`AccumulatorError::Shutdown`]：累加器在结果返回前关闭。
+/// - [`AccumulatorError::Timeout`]：item 在批处理前超时。
 pub struct ReplyHandle<R> {
-    rx: oneshot::Receiver<R>,
+    rx: oneshot::Receiver<Result<R, AccumulatorError>>,
 }
 
 impl<R> ReplyHandle<R> {
     /// 创建新的 ReplyHandle（内部使用）。
-    pub(crate) fn new(rx: oneshot::Receiver<R>) -> Self {
+    pub(crate) fn new(rx: oneshot::Receiver<Result<R, AccumulatorError>>) -> Self {
         Self { rx }
     }
 }
@@ -98,11 +100,31 @@ impl<R> Future for ReplyHandle<R> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.rx).poll(cx) {
-            Poll::Ready(Ok(r)) => Poll::Ready(Ok(r)),
+            Poll::Ready(Ok(Ok(r))) => Poll::Ready(Ok(r)),
+            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
             Poll::Ready(Err(_recv_error)) => Poll::Ready(Err(AccumulatorError::Shutdown)),
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+/// Item 优先级。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Priority {
+    /// 普通优先级（默认）。
+    #[default]
+    Normal,
+    /// 高优先级：插队到 buffer 前端。
+    High,
+}
+
+/// Submit 选项，通过 [`AccumulatorHandle::submit_with`](super::accumulator::AccumulatorHandle::submit_with) 传入。
+#[derive(Debug, Default, Clone)]
+pub struct SubmitOptions {
+    /// 优先级。默认为 [`Priority::Normal`]。
+    pub priority: Priority,
+    /// item 超时时间。`None` 表示不超时。
+    pub ttl: Option<Duration>,
 }
 
 /// flush 完成后的汇总信息，供指标收集和窗口控制使用。
@@ -122,4 +144,6 @@ pub struct FlushInfo {
     pub execution_time: Duration,
     /// 距上次 flush 的时间。
     pub time_since_last_flush: Duration,
+    /// 本批次总权重（启用权重追踪时有意义）。
+    pub total_weight: Option<usize>,
 }

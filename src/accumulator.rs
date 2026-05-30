@@ -7,14 +7,20 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::batch::{Batch, BatchProcessor, FlushInfo, ReplyHandle};
+use crate::batch::{Batch, BatchProcessor, FlushInfo, Priority, ReplyHandle, SubmitOptions};
 use crate::config::{AccumulatorConfig, ConcurrencyMode};
 use crate::controller::WindowController;
 use crate::error::AccumulatorError;
 use crate::metrics::{MetricsCollector, BYPASS_DRAIN_LIMIT};
+use crate::stats::{AccumulatorStats, StatsSnapshot};
+
+use std::collections::VecDeque;
 
 /// 并发满后重试 flush 的间隔。
 const RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// Reply sender 类型别名，简化复杂类型签名。
+type ReplySender<R> = Option<tokio::sync::oneshot::Sender<Result<R, AccumulatorError>>>;
 
 /// Drop 时自动递减 inflight_count，确保 panic 也不会泄漏计数。
 struct InflightGuard {
@@ -35,11 +41,25 @@ impl Drop for InflightGuard {
 }
 
 /// 主通道中传递的 item 类型。
-pub(crate) enum ChannelItem<T, R> {
-    /// fire-and-forget（submit）
-    FireAndForget(T),
-    /// 带回复通道（submit_with_reply）
-    WithReply(T, tokio::sync::oneshot::Sender<R>),
+pub(crate) struct ChannelItem<T, R> {
+    /// item 数据。
+    pub value: T,
+    /// 超时截止时间。`None` 表示不超时。
+    pub deadline: Option<Instant>,
+    /// 回复通道。`None` 表示 fire-and-forget。
+    pub reply: Option<tokio::sync::oneshot::Sender<Result<R, AccumulatorError>>>,
+    /// 优先级。
+    pub priority: Priority,
+}
+
+/// 缓冲区中暂存的 item。
+pub(crate) struct BufferItem<T, R> {
+    /// item 数据。
+    value: T,
+    /// 超时截止时间。`None` 表示不超时。
+    deadline: Option<Instant>,
+    /// 回复通道。`None` 表示 fire-and-forget。
+    reply: Option<tokio::sync::oneshot::Sender<Result<R, AccumulatorError>>>,
 }
 
 /// 向累加器提交 item 的句柄。
@@ -51,6 +71,7 @@ pub struct AccumulatorHandle<T, R> {
     pub(crate) pending_count: Arc<AtomicUsize>,
     pub(crate) max_queue_depth: Option<usize>,
     pub(crate) flush_notify: Arc<Notify>,
+    pub(crate) stats: Arc<AccumulatorStats>,
 }
 
 impl<T: Send, R: Send> Clone for AccumulatorHandle<T, R> {
@@ -61,6 +82,7 @@ impl<T: Send, R: Send> Clone for AccumulatorHandle<T, R> {
             pending_count: Arc::clone(&self.pending_count),
             max_queue_depth: self.max_queue_depth,
             flush_notify: Arc::clone(&self.flush_notify),
+            stats: Arc::clone(&self.stats),
         }
     }
 }
@@ -96,11 +118,19 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
         }
 
         self.sender
-            .send(ChannelItem::FireAndForget(item))
+            .send(ChannelItem {
+                value: item,
+                deadline: None,
+                reply: None,
+                priority: Priority::Normal,
+            })
             .map_err(|_| {
                 self.pending_count.fetch_sub(1, Ordering::Release);
                 AccumulatorError::Shutdown
-            })
+            })?;
+
+        self.stats.record_submit();
+        Ok(())
     }
 
     /// 提交一个 item，返回 [`ReplyHandle`]，`.await` 后拿到处理结果。
@@ -135,12 +165,18 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         self.sender
-            .send(ChannelItem::WithReply(item, tx))
+            .send(ChannelItem {
+                value: item,
+                deadline: None,
+                reply: Some(tx),
+                priority: Priority::Normal,
+            })
             .map_err(|_| {
                 self.pending_count.fetch_sub(1, Ordering::Release);
                 AccumulatorError::Shutdown
             })?;
 
+        self.stats.record_submit();
         Ok(ReplyHandle::new(rx))
     }
 
@@ -159,6 +195,19 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
         self.flush_notify.notify_one();
     }
 
+    /// 获取运行统计快照。
+    ///
+    /// 需要在 [`AccumulatorConfig::with_stats(true)`] 开启统计。
+    /// 若未开启，各计数器均为 0。
+    pub fn stats(&self) -> StatsSnapshot {
+        self.stats.snapshot(
+            self.pending_count(),
+            0, // buffer_size 由 Accumulator 侧提供才有准确值
+            0, // inflight_count
+            0, // current_weight
+        )
+    }
+
     /// 绕过批处理，直接交付处理器。
     ///
     /// item 打包为单 item 批，跳过 buffer 和 timer，直接交给
@@ -172,7 +221,87 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
     pub fn bypass(&self, item: T) -> Result<(), AccumulatorError> {
         self.bypass_sender
             .send(vec![item])
-            .map_err(|_| AccumulatorError::Shutdown)
+            .map_err(|_| AccumulatorError::Shutdown)?;
+        self.stats.record_bypass();
+        Ok(())
+    }
+
+    /// 提交一个 item，可指定优先级和超时。
+    ///
+    /// # Errors
+    ///
+    /// - [`AccumulatorError::QueueFull`]：超过 `max_queue_depth` 限制。
+    /// - [`AccumulatorError::Shutdown`]：累加器已关闭。
+    pub fn submit_with(
+        &self,
+        item: T,
+        opts: SubmitOptions,
+    ) -> Result<ReplyHandle<R>, AccumulatorError> {
+        let result = self.pending_count.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |pending| {
+                if let Some(max) = self.max_queue_depth
+                    && pending >= max
+                {
+                    return None;
+                }
+                Some(pending + 1)
+            },
+        );
+
+        if let Err(prev) = result {
+            return Err(AccumulatorError::QueueFull {
+                max: self.max_queue_depth.unwrap_or(0),
+                pending: prev,
+            });
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let deadline = opts.ttl.map(|ttl| Instant::now() + ttl);
+
+        self.sender
+            .send(ChannelItem {
+                value: item,
+                deadline,
+                reply: Some(tx),
+                priority: opts.priority,
+            })
+            .map_err(|_| {
+                self.pending_count.fetch_sub(1, Ordering::Release);
+                AccumulatorError::Shutdown
+            })?;
+
+        self.stats.record_submit();
+        Ok(ReplyHandle::new(rx))
+    }
+
+    /// 提交高优先级 item 并等待结果。等价于
+    /// `submit_with(item, SubmitOptions { priority: Priority::High, ..Default::default() })`。
+    pub fn submit_high(&self, item: T) -> Result<ReplyHandle<R>, AccumulatorError> {
+        self.submit_with(
+            item,
+            SubmitOptions {
+                priority: Priority::High,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// 提交 item 并设置超时。等价于
+    /// `submit_with(item, SubmitOptions { ttl: Some(ttl), ..Default::default() })`。
+    pub fn submit_with_timeout(
+        &self,
+        item: T,
+        ttl: Duration,
+    ) -> Result<ReplyHandle<R>, AccumulatorError> {
+        self.submit_with(
+            item,
+            SubmitOptions {
+                ttl: Some(ttl),
+                ..Default::default()
+            },
+        )
     }
 }
 
@@ -185,7 +314,7 @@ pub struct BatchAccumulator<T, R, P, M, C> {
     pub(crate) item_rx: UnboundedReceiver<ChannelItem<T, R>>,
     pub(crate) bypass_rx: UnboundedReceiver<Vec<T>>,
     pub(crate) flush_notify: Arc<Notify>,
-    pub(crate) buffer: Vec<(T, Option<tokio::sync::oneshot::Sender<R>>)>,
+    pub(crate) buffer: VecDeque<BufferItem<T, R>>,
     pub(crate) current_window: Duration,
     pub(crate) next_batch_id: u64,
     pub(crate) last_flush_time: Instant,
@@ -194,6 +323,9 @@ pub struct BatchAccumulator<T, R, P, M, C> {
     pub(crate) feedback_tx: UnboundedSender<FlushInfo>,
     pub(crate) inflight: JoinSet<()>,
     pub(crate) inflight_count: Arc<AtomicUsize>,
+    pub(crate) stats: Arc<AccumulatorStats>,
+    pub(crate) weight_fn: Arc<dyn Fn(&T) -> usize + Send + Sync>,
+    pub(crate) current_weight: usize,
 }
 
 impl<T, R, P, M, C> BatchAccumulator<T, R, P, M, C>
@@ -234,6 +366,9 @@ where
                 }
             }
 
+            // 清理过期 item
+            self.drain_expired();
+
             let sleep = tokio::time::sleep_until(deadline);
 
             tokio::select! {
@@ -264,19 +399,41 @@ where
                 // 4. 接收新 item
                 maybe_item = self.item_rx.recv() => {
                     match maybe_item {
-                        Some(channel_item) => {
+                        Some(ch) => {
                             self.pending_count.fetch_sub(1, Ordering::Release);
-                            match channel_item {
-                                ChannelItem::FireAndForget(item) => {
-                                    self.buffer.push((item, None));
+
+                            // 检查刚提交的 item 是否已过期
+                            if let Some(dl) = ch.deadline
+                                && Instant::now() >= dl {
+                                    if let Some(tx) = ch.reply {
+                                        let _ = tx.send(Err(AccumulatorError::Timeout));
+                                    }
+                                    self.stats.record_dropped_timeout(1);
+                                    continue;
                                 }
-                                ChannelItem::WithReply(item, tx) => {
-                                    self.buffer.push((item, Some(tx)));
+
+                            let buffer_item = BufferItem {
+                                value: ch.value,
+                                deadline: ch.deadline,
+                                reply: ch.reply,
+                            };
+
+                            self.current_weight = self
+                                .current_weight
+                                .saturating_add((self.weight_fn)(&buffer_item.value));
+
+                            match ch.priority {
+                                Priority::High => {
+                                    self.buffer.push_front(buffer_item);
+                                    // 高优先级到达时触发立即 flush
+                                    self.flush_notify.notify_one();
+                                }
+                                Priority::Normal => {
+                                    self.buffer.push_back(buffer_item);
                                 }
                             }
 
-                            if let Some(max) = self.config.max_batch_size
-                                && self.buffer.len() >= max
+                            if self.should_flush()
                                 && self.flush_batch().await
                             {
                                 deadline = Instant::now() + self.current_window;
@@ -336,11 +493,13 @@ where
 
     /// 并发模式：在后台 task 中处理批次。
     fn spawn_flush(&mut self, time_since_last_flush: Duration) {
-        let buffer_items = std::mem::take(&mut self.buffer);
-        let (items, senders): (Vec<T>, Vec<Option<tokio::sync::oneshot::Sender<R>>>) =
-            buffer_items.into_iter().unzip();
+        let buffer_items: Vec<BufferItem<T, R>> = self.buffer.drain(..).collect();
+        let batch_size = buffer_items.len();
+        let total_weight = self.current_weight;
+        self.current_weight = 0;
+        let (items, senders): (Vec<T>, Vec<ReplySender<R>>) =
+            buffer_items.into_iter().map(|bi| (bi.value, bi.reply)).unzip();
 
-        let batch_size = items.len();
         let batch_id = self.next_batch_id;
         self.next_batch_id += 1;
 
@@ -371,7 +530,7 @@ where
                 .zip(results)
             {
                 if let Some(tx) = sender {
-                    let _ = tx.send(result);
+                    let _ = tx.send(Ok(result));
                 }
             }
 
@@ -385,6 +544,7 @@ where
                 batch_id,
                 execution_time,
                 time_since_last_flush,
+                total_weight: max_batch_size.map(|_| total_weight),
             };
 
             // 先递减 inflight_count 再发送 feedback，避免竞态
@@ -434,11 +594,13 @@ where
 
     /// flush 内核心逻辑（串行模式）：处理 buffer → FlushInfo → 记录指标。
     async fn flush_inner(&mut self, time_since_last_flush: Duration) {
-        let buffer_items = std::mem::take(&mut self.buffer);
-        let (items, senders): (Vec<T>, Vec<Option<tokio::sync::oneshot::Sender<R>>>) =
-            buffer_items.into_iter().unzip();
+        let buffer_items: Vec<BufferItem<T, R>> = self.buffer.drain(..).collect();
 
-        let batch_size = items.len();
+        let batch_size = buffer_items.len();
+        let total_weight = self.current_weight;
+        self.current_weight = 0;
+        let (items, senders): (Vec<T>, Vec<ReplySender<R>>) =
+            buffer_items.into_iter().map(|bi| (bi.value, bi.reply)).unzip();
         let batch_id = self.next_batch_id;
         self.next_batch_id += 1;
 
@@ -457,7 +619,7 @@ where
         // 发送结果给调用方
         for (sender, result) in senders.into_iter().zip(results) {
             if let Some(tx) = sender {
-                let _ = tx.send(result);
+                let _ = tx.send(Ok(result));
             }
         }
 
@@ -471,9 +633,11 @@ where
             batch_id,
             execution_time,
             time_since_last_flush,
+            total_weight: self.config.max_batch_weight.map(|_| total_weight),
         };
 
         self.metrics.record_flush(&info).await;
+        self.stats.record_flush(execution_time);
 
         self.last_flush_time = Instant::now();
     }
@@ -481,6 +645,7 @@ where
     /// 处理并发模式下的后台任务反馈。
     async fn handle_feedback(&mut self, info: FlushInfo) {
         self.metrics.record_flush(&info).await;
+        self.stats.record_flush(info.execution_time);
         self.last_flush_time = Instant::now();
 
         let snapshot = self.metrics.snapshot();
@@ -498,19 +663,74 @@ where
         }
     }
 
+    /// 清理缓冲区中的过期 item。
+    fn drain_expired(&mut self) {
+        let now = Instant::now();
+        let mut dropped_count = 0u64;
+
+        // 收集未过期的 item，发送超时错误给过期的
+        let mut kept = VecDeque::with_capacity(self.buffer.len());
+        while let Some(item) = self.buffer.pop_front() {
+            let expired = item.deadline.is_some_and(|d| now >= d);
+            if expired {
+                if let Some(tx) = item.reply {
+                    let _ = tx.send(Err(AccumulatorError::Timeout));
+                }
+                self.current_weight = self
+                    .current_weight
+                    .saturating_sub((self.weight_fn)(&item.value));
+                dropped_count += 1;
+            } else {
+                kept.push_back(item);
+            }
+        }
+        self.buffer = kept;
+
+        if dropped_count > 0 {
+            self.stats.record_dropped_timeout(dropped_count);
+        }
+    }
+
+    /// 判断是否应该触发 flush（基于 item 数或权重）。
+    fn should_flush(&self) -> bool {
+        if let Some(max) = self.config.max_batch_size
+            && self.buffer.len() >= max
+        {
+            return true;
+        }
+        if let Some(max_weight) = self.config.max_batch_weight
+            && self.current_weight >= max_weight
+        {
+            return true;
+        }
+        false
+    }
+
     /// 通道关闭后清空所有 item（包括 bypass 通道和 inflight task）。
     async fn drain(&mut self) {
         // 清空主通道
-        while let Some(channel_item) = self.item_rx.recv().await {
+        while let Some(ch) = self.item_rx.recv().await {
             self.pending_count.fetch_sub(1, Ordering::Release);
-            match channel_item {
-                ChannelItem::FireAndForget(item) => {
-                    self.buffer.push((item, None));
+
+            // 跳过已过期 item
+            if let Some(dl) = ch.deadline
+                && Instant::now() >= dl {
+                    if let Some(tx) = ch.reply {
+                        let _ = tx.send(Err(AccumulatorError::Timeout));
+                    }
+                    self.stats.record_dropped_timeout(1);
+                    continue;
                 }
-                ChannelItem::WithReply(item, tx) => {
-                    self.buffer.push((item, Some(tx)));
-                }
-            }
+
+            self.current_weight = self
+                .current_weight
+                .saturating_add((self.weight_fn)(&ch.value));
+
+            self.buffer.push_back(BufferItem {
+                value: ch.value,
+                deadline: ch.deadline,
+                reply: ch.reply,
+            });
         }
 
         match self.config.concurrency_mode {

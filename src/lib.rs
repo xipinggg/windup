@@ -52,11 +52,12 @@ pub mod config;
 pub mod controller;
 pub mod error;
 pub mod metrics;
+pub mod stats;
 
 /// 常用类型和 trait 的批量导入。
 pub mod prelude {
     pub use crate::accumulator::AccumulatorHandle;
-    pub use crate::batch::{Batch, BatchProcessor, ReplyHandle};
+    pub use crate::batch::{Batch, BatchProcessor, Priority, ReplyHandle, SubmitOptions};
     pub use crate::config::{AccumulatorConfig, ConcurrencyMode};
     pub use crate::controller::{
         AdaptiveController, FixedController, LatencyAdaptiveController, WindowController,
@@ -65,4 +66,5 @@ pub mod prelude {
     pub use crate::metrics::{
         DefaultMetrics, MetricsCollector, MetricsSnapshot, BYPASS_DRAIN_LIMIT, DEFAULT_EMA_ALPHA,
     };
+    pub use crate::stats::StatsSnapshot;
 }

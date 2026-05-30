@@ -20,4 +20,8 @@ pub enum AccumulatorError {
         /// 无效原因。
         reason: String,
     },
+
+    /// item 在批处理前已超时。
+    #[error("item timed out before processing")]
+    Timeout,
 }
