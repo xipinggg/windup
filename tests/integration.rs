@@ -10,8 +10,10 @@ struct MockProcessor<T: Send> {
 }
 
 impl<T: Send + 'static> BatchProcessor<T> for MockProcessor<T> {
-    async fn process(&self, batch: Batch<T>) {
+    async fn process(&self, batch: Batch<T>) -> Vec<()> {
+        let n = batch.len();
         self.batches.lock().unwrap().push(batch);
+        vec![(); n]
     }
 }
 
@@ -210,4 +212,306 @@ async fn test_multi_producer() {
 
     let total: usize = batches.lock().unwrap().iter().map(|b| b.len()).sum();
     assert_eq!(total, PRODUCERS * PER_PRODUCER);
+}
+
+// ─── reply 机制测试 ───
+
+#[tokio::test]
+async fn test_reply_single_result() {
+    tokio::time::pause();
+    // 处理器：将 i32 翻倍
+    struct Double;
+    impl BatchProcessor<i32, i32> for Double {
+        async fn process(&self, batch: Batch<i32>) -> Vec<i32> {
+            batch.into_inner().into_iter().map(|x| x * 2).collect()
+        }
+    }
+
+    let config = cfg(100);
+    let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(100));
+    tokio::spawn(accumulator.run());
+
+    let reply = handle.submit_with_reply(21).unwrap();
+    let result = reply.await.unwrap();
+    assert_eq!(result, 42);
+
+    drop(handle);
+}
+
+#[tokio::test]
+async fn test_reply_multiple_results() {
+    tokio::time::pause();
+    // 处理器：字符串大写
+    struct Upper;
+    impl BatchProcessor<String, String> for Upper {
+        async fn process(&self, batch: Batch<String>) -> Vec<String> {
+            batch
+                .into_inner()
+                .into_iter()
+                .map(|s| s.to_uppercase())
+                .collect()
+        }
+    }
+
+    let config = cfg(200);
+    let (handle, accumulator) = config.build(Upper, DefaultMetrics::new(), fixed(200));
+    tokio::spawn(accumulator.run());
+
+    let r1 = handle.submit_with_reply("hello".into()).unwrap();
+    let r2 = handle.submit_with_reply("world".into()).unwrap();
+    let r3 = handle.submit_with_reply("rust".into()).unwrap();
+
+    assert_eq!(r1.await.unwrap(), "HELLO");
+    assert_eq!(r2.await.unwrap(), "WORLD");
+    assert_eq!(r3.await.unwrap(), "RUST");
+
+    drop(handle);
+}
+
+#[tokio::test]
+async fn test_reply_on_shutdown() {
+    tokio::time::pause();
+    struct Double;
+    impl BatchProcessor<i32, i32> for Double {
+        async fn process(&self, batch: Batch<i32>) -> Vec<i32> {
+            batch.into_inner().into_iter().map(|x| x * 2).collect()
+        }
+    }
+
+    let config = cfg(10_000);
+    let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(10_000));
+    let jh = tokio::spawn(accumulator.run());
+
+    let reply = handle.submit_with_reply(10).unwrap();
+    drop(handle);
+
+    // 关闭后 reply 应该返回完成或 shutdown
+    match reply.await {
+        Ok(20) => {} // drain 处理了
+        Err(AccumulatorError::Shutdown) => {} // 也可能是 shutdown
+        other => panic!("unexpected result: {other:?}"),
+    }
+    jh.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_reply_mixed_fire_and_forget() {
+    tokio::time::pause();
+    struct Double;
+    impl BatchProcessor<i32, i32> for Double {
+        async fn process(&self, batch: Batch<i32>) -> Vec<i32> {
+            batch.into_inner().into_iter().map(|x| x * 2).collect()
+        }
+    }
+
+    let config = cfg(200);
+    let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(200));
+    tokio::spawn(accumulator.run());
+
+    // fire-and-forget
+    handle.submit(1).unwrap();
+    handle.submit(2).unwrap();
+    // with reply
+    let reply = handle.submit_with_reply(10).unwrap();
+    // more fire-and-forget
+    handle.submit(3).unwrap();
+
+    let result = reply.await.unwrap();
+    assert_eq!(result, 20);
+
+    // 确保 fire-and-forget 也被处理了（不 panic 即可）
+    drop(handle);
+}
+
+// ─── 并发模式测试 ───
+
+#[tokio::test]
+async fn test_concurrent_basic_time_flush() {
+    tokio::time::pause();
+    let (proc, batches) = mock::<i32>();
+    let config = cfg(100)
+        .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100));
+    tokio::spawn(accumulator.run());
+
+    handle.submit(1).unwrap();
+    handle.submit(2).unwrap();
+    tick(Duration::from_millis(150)).await;
+
+    let guard = batches.lock().unwrap();
+    assert!(!guard.is_empty(), "concurrent batch should be processed");
+    assert_eq!(guard[0].len(), 2);
+
+    drop(handle);
+}
+
+#[tokio::test]
+async fn test_concurrent_drain_on_close() {
+    tokio::time::pause();
+    let (proc, batches) = mock::<i32>();
+    let config = cfg(10_000)
+        .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
+    let jh = tokio::spawn(accumulator.run());
+
+    handle.submit(1).unwrap();
+    handle.submit(2).unwrap();
+    handle.submit(3).unwrap();
+    drop(handle);
+    jh.await.unwrap();
+
+    assert_eq!(batches.lock().unwrap().len(), 1);
+    assert_eq!(batches.lock().unwrap()[0].len(), 3);
+}
+
+#[tokio::test]
+async fn test_concurrent_multi_producer() {
+    tokio::time::pause();
+    let (proc, batches) = mock::<usize>();
+    let config = cfg(200)
+        .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(200));
+    let jh = tokio::spawn(accumulator.run());
+
+    const PRODUCERS: usize = 10;
+    const PER_PRODUCER: usize = 100;
+
+    let mut handles = vec![];
+    for _ in 0..PRODUCERS {
+        let h = handle.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..PER_PRODUCER {
+                h.submit(i).unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    drop(handle);
+    tick(Duration::from_millis(500)).await;
+    jh.await.unwrap();
+
+    let total: usize = batches.lock().unwrap().iter().map(|b| b.len()).sum();
+    assert_eq!(total, PRODUCERS * PER_PRODUCER);
+}
+
+#[tokio::test]
+async fn test_concurrent_max_batch_size() {
+    tokio::time::pause();
+    let (proc, batches) = mock::<i32>();
+    let config = cfg(10_000)
+        .with_max_batch_size(3)
+        .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
+    tokio::spawn(accumulator.run());
+
+    handle.submit(1).unwrap();
+    handle.submit(2).unwrap();
+    handle.submit(3).unwrap();
+    // 达到 max_batch_size，应在后台处理
+    tick(Duration::from_millis(50)).await;
+
+    assert_eq!(batches.lock().unwrap().len(), 1);
+    assert_eq!(batches.lock().unwrap()[0].len(), 3);
+
+    drop(handle);
+}
+
+#[tokio::test]
+async fn test_concurrent_max_inflight_limit() {
+    tokio::time::pause();
+    // 慢速处理器，模拟耗时处理
+    struct SlowProcessor<T: Send> {
+        batches: Batches<T>,
+    }
+    impl<T: Send + 'static> BatchProcessor<T> for SlowProcessor<T> {
+        async fn process(&self, batch: Batch<T>) -> Vec<()> {
+            let n = batch.len();
+            // 模拟耗时
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            self.batches.lock().unwrap().push(batch);
+            vec![(); n]
+        }
+    }
+
+    let batches: Batches<i32> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let proc = SlowProcessor {
+        batches: Arc::clone(&batches),
+    };
+
+    // max_inflight=1，窗口很长
+    let config = AccumulatorConfig::new(
+        Duration::from_millis(20),  // 短窗口，快速触发 timer
+        Duration::from_millis(10),
+        Duration::from_secs(10),
+    )
+    .unwrap()
+    .with_max_batch_size(1) // 每个 item 单独一个 batch
+    .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 1 });
+
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(20));
+    tokio::spawn(accumulator.run());
+
+    // 快速提交多个 item
+    for i in 0..5 {
+        handle.submit(i).unwrap();
+    }
+
+    // 等待足够时间让所有 task 完成
+    tick(Duration::from_secs(5)).await;
+
+    let guard = batches.lock().unwrap();
+    let total: usize = guard.iter().map(|b| b.len()).sum();
+    assert_eq!(total, 5, "all items should be processed");
+
+    drop(handle);
+}
+
+#[tokio::test]
+async fn test_concurrent_with_reply() {
+    tokio::time::pause();
+    // 并发模式下使用 reply
+    struct Double;
+    impl BatchProcessor<i32, i32> for Double {
+        async fn process(&self, batch: Batch<i32>) -> Vec<i32> {
+            batch.into_inner().into_iter().map(|x| x * 2).collect()
+        }
+    }
+
+    let config = cfg(200)
+        .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
+    let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(200));
+    tokio::spawn(accumulator.run());
+
+    let r1 = handle.submit_with_reply(10).unwrap();
+    let r2 = handle.submit_with_reply(20).unwrap();
+
+    assert_eq!(r1.await.unwrap(), 20);
+    assert_eq!(r2.await.unwrap(), 40);
+
+    drop(handle);
+}
+
+#[tokio::test]
+async fn test_serial_unchanged() {
+    tokio::time::pause();
+    let (proc, batches) = mock::<i32>();
+    // 不设置 concurrency_mode，默认 Serial
+    let config = cfg(100);
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100));
+    tokio::spawn(accumulator.run());
+
+    handle.submit(1).unwrap();
+    handle.submit(2).unwrap();
+    handle.submit(3).unwrap();
+
+    tick(Duration::from_millis(80)).await;
+    assert_eq!(batches.lock().unwrap().len(), 0);
+
+    tick(Duration::from_millis(40)).await;
+    assert_eq!(batches.lock().unwrap().len(), 1);
+    assert_eq!(batches.lock().unwrap()[0].len(), 3);
+
+    drop(handle);
 }

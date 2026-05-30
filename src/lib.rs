@@ -11,8 +11,9 @@
 //!
 //! struct MyProcessor;
 //! impl BatchProcessor<i32> for MyProcessor {
-//!     async fn process(&self, batch: Batch<i32>) {
+//!     async fn process(&self, batch: Batch<i32>) -> Vec<()> {
 //!         println!("处理批次 {}: {} 条", batch.batch_id(), batch.len());
+//!         vec![(); batch.len()]
 //!     }
 //! }
 //!
@@ -54,8 +55,8 @@ pub mod metrics;
 /// 常用类型和 trait 的批量导入。
 pub mod prelude {
     pub use crate::accumulator::AccumulatorHandle;
-    pub use crate::batch::{Batch, BatchProcessor};
-    pub use crate::config::AccumulatorConfig;
+    pub use crate::batch::{Batch, BatchProcessor, ReplyHandle};
+    pub use crate::config::{AccumulatorConfig, ConcurrencyMode};
     pub use crate::controller::{
         AdaptiveController, FixedController, LatencyAdaptiveController, WindowController,
     };

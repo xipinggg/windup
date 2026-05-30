@@ -1,14 +1,24 @@
 use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use tokio::sync::oneshot;
 use tokio::time::Instant;
+
+use crate::error::AccumulatorError;
 
 /// 批处理器，负责消费累加器 flush 出的批次。
 ///
 /// 由用户实现，包含实际的批量处理逻辑。
-pub trait BatchProcessor<T: Send>: Send + 'static {
-    /// 处理一个批次。
-    fn process(&self, batch: Batch<T>) -> impl Future<Output = ()> + Send;
+///
+/// # 类型参数
+///
+/// - `T`：批次中 item 的类型。
+/// - `R`：每个 item 的处理结果类型，默认为 `()`（fire-and-forget）。
+pub trait BatchProcessor<T: Send, R: Send = ()>: Send + 'static {
+    /// 处理一个批次，按 item 顺序返回每个 item 的处理结果。
+    fn process(&self, batch: Batch<T>) -> impl Future<Output = Vec<R>> + Send;
 }
 
 /// 一个待处理的批次。
@@ -64,6 +74,35 @@ impl<T> Batch<T> {
     /// 批次从创建到现在经过的时间。
     pub fn age(&self) -> Duration {
         self.created_at.elapsed()
+    }
+}
+
+/// 调用方提交 item 后等待结果的 Future。
+///
+/// 通过 [`AccumulatorHandle::submit_with_reply`](super::accumulator::AccumulatorHandle::submit_with_reply)
+/// 获取，`.await` 后得到对应 item 的处理结果。
+///
+/// 如果累加器在结果返回前关闭， `.await` 返回 `Err(AccumulatorError::Shutdown)`。
+pub struct ReplyHandle<R> {
+    rx: oneshot::Receiver<R>,
+}
+
+impl<R> ReplyHandle<R> {
+    /// 创建新的 ReplyHandle（内部使用）。
+    pub(crate) fn new(rx: oneshot::Receiver<R>) -> Self {
+        Self { rx }
+    }
+}
+
+impl<R> Future for ReplyHandle<R> {
+    type Output = Result<R, AccumulatorError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.rx).poll(cx) {
+            Poll::Ready(Ok(r)) => Poll::Ready(Ok(r)),
+            Poll::Ready(Err(_recv_error)) => Poll::Ready(Err(AccumulatorError::Shutdown)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

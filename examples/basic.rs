@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use draft::prelude::*;
 
-/// 模拟批处理服务。
-struct PrintProcessor {
+/// 带结果返回的批处理器：将接收到的字符串大写后返回。
+struct UpperProcessor {
     total: AtomicUsize,
 }
 
-impl BatchProcessor<String> for PrintProcessor {
-    async fn process(&self, batch: Batch<String>) {
+impl BatchProcessor<String, String> for UpperProcessor {
+    async fn process(&self, batch: Batch<String>) -> Vec<String> {
         let n = batch.len();
         let count = self.total.fetch_add(n, Ordering::Relaxed) + n;
         println!(
@@ -26,7 +26,13 @@ impl BatchProcessor<String> for PrintProcessor {
             count,
         );
         // 模拟下游处理耗时
-        tokio::time::sleep(Duration::from_millis(n as u64 * 2)).await;
+        tokio::time::sleep(Duration::from_millis(n as u64 * 5)).await;
+        // 返回处理结果
+        batch
+            .into_inner()
+            .into_iter()
+            .map(|s| s.to_uppercase())
+            .collect()
     }
 }
 
@@ -38,10 +44,11 @@ async fn main() {
         Duration::from_secs(3),
     )
     .unwrap()
-    .with_max_batch_size(20);
+    .with_max_batch_size(20)
+    .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 4 });
 
     let (handle, accumulator) = config.build(
-        PrintProcessor {
+        UpperProcessor {
             total: AtomicUsize::new(0),
         },
         DefaultMetrics::new(),
@@ -50,43 +57,45 @@ async fn main() {
 
     let _jh = tokio::spawn(accumulator.run());
 
-    // 场景1: 零星提交
-    println!("=== 场景1: 零星提交 ===");
+    // 场景1: reply — 提交并等待结果
+    println!("=== 场景1: submit_with_reply ===");
+    let reply = handle
+        .submit_with_reply("hello-world".into())
+        .unwrap();
+    let result = reply.await.unwrap();
+    println!("  结果: {result}");
+
+    // 场景2: fire-and-forget + reply 混合
+    println!("\n=== 场景2: fire-and-forget + reply 混合 ===");
     for i in 1..=5 {
-        handle.submit(format!("item-{i}")).unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.submit(format!("fire-{i}")).unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let reply2 = handle
+        .submit_with_reply("mixed-reply".into())
+        .unwrap();
+    println!("  结果: {}", reply2.await.unwrap());
 
-    // 场景2: 突发流量
-    println!("\n=== 场景2: 突发流量 ===");
-    for i in 1..=25 {
-        handle.submit(format!("burst-{i}")).unwrap();
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // 场景3: bypass
+    // 场景3: bypass（不支持 reply）
     println!("\n=== 场景3: bypass ===");
     handle.bypass("🚀 urgent-bypass".into()).unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // 场景4: 多生产者
-    println!("\n=== 场景4: 多生产者并发 ===");
-    let h2 = handle.clone();
-    let h3 = handle.clone();
-    let t1 = tokio::spawn(async move {
-        for i in 0..30 {
-            h2.submit(format!("A-{i}")).unwrap();
-        }
-    });
-    let t2 = tokio::spawn(async move {
-        for i in 0..30 {
-            h3.submit(format!("B-{i}")).unwrap();
-        }
-    });
-    t1.await.unwrap();
-    t2.await.unwrap();
+    // 场景4: 多生产者并发 reply
+    println!("\n=== 场景4: 多生产者并发 reply ===");
+    let mut handles = vec![];
+    for i in 0..5 {
+        let h = handle.clone();
+        handles.push(tokio::spawn(async move {
+            let reply = h
+                .submit_with_reply(format!("task-{i}"))
+                .unwrap();
+            let result = reply.await.unwrap();
+            println!("  task-{i} 结果: {result}");
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     println!("\n=== 关闭 ===");

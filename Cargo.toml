@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1", features = ["time", "sync", "macros"] }
+tokio = { version = "1", features = ["time", "sync", "macros", "rt"] }
 thiserror = "2"
 
 [dev-dependencies]

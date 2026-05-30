@@ -4,12 +4,28 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
+use tokio::task::JoinSet;
 
 use crate::accumulator::{AccumulatorHandle, BatchAccumulator};
-use crate::batch::BatchProcessor;
+use crate::batch::{BatchProcessor, FlushInfo};
 use crate::controller::WindowController;
 use crate::error::AccumulatorError;
 use crate::metrics::MetricsCollector;
+
+/// 并发模式配置。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ConcurrencyMode {
+    /// 串行模式：每个批次在主循环中同步处理（默认，当前行为）。
+    #[default]
+    Serial,
+    /// 并发模式：批次在后台 tokio 任务中处理，主循环可继续收集新 item。
+    ///
+    /// `max_inflight` 限制最大并发批次数，`0` 表示无限制。
+    Concurrent {
+        /// 最大并发批次数。
+        max_inflight: usize,
+    },
+}
 
 /// 累加器配置（与 item 类型无关）。
 ///
@@ -23,6 +39,7 @@ pub struct AccumulatorConfig {
     pub(crate) max_batch_size: Option<usize>,
     pub(crate) max_queue_depth: Option<usize>,
     pub(crate) flush_empty_batches: bool,
+    pub(crate) concurrency_mode: ConcurrencyMode,
 }
 
 impl AccumulatorConfig {
@@ -57,6 +74,7 @@ impl AccumulatorConfig {
             max_batch_size: None,
             max_queue_depth: None,
             flush_empty_batches: false,
+            concurrency_mode: ConcurrencyMode::Serial,
         })
     }
 
@@ -79,24 +97,34 @@ impl AccumulatorConfig {
         self
     }
 
+    /// 设置并发模式。默认为 [`ConcurrencyMode::Serial`]。
+    pub fn with_concurrency_mode(mut self, mode: ConcurrencyMode) -> Self {
+        self.concurrency_mode = mode;
+        self
+    }
+
     /// 消费配置，构建 [`AccumulatorHandle`] 和 [`BatchAccumulator`]。
     ///
-    /// item 类型 `T` 从 `processor: P` 自动推断。
-    pub fn build<T, P, M, C>(
+    /// item 类型 `T` 和结果类型 `R` 从 `processor: P` 自动推断。
+    #[allow(clippy::type_complexity)]
+    pub fn build<T, R, P, M, C>(
         self,
         processor: P,
         metrics: M,
         controller: C,
-    ) -> (AccumulatorHandle<T>, BatchAccumulator<T, P, M, C>)
+    ) -> (AccumulatorHandle<T, R>, BatchAccumulator<T, R, P, M, C>)
     where
         T: Send + 'static,
-        P: BatchProcessor<T>,
+        R: Send + 'static,
+        P: BatchProcessor<T, R>,
         M: MetricsCollector,
         C: WindowController,
     {
         let (tx, rx) = mpsc::unbounded_channel();
         let (bypass_tx, bypass_rx) = mpsc::unbounded_channel();
+        let (feedback_tx, feedback_rx) = mpsc::unbounded_channel::<FlushInfo>();
         let pending_count = Arc::new(AtomicUsize::new(0));
+        let inflight_count = Arc::new(AtomicUsize::new(0));
         let flush_notify = Arc::new(Notify::new());
 
         let handle = AccumulatorHandle {
@@ -111,7 +139,7 @@ impl AccumulatorConfig {
 
         let accumulator = BatchAccumulator {
             config: self,
-            processor,
+            processor: Arc::new(processor),
             metrics,
             controller,
             item_rx: rx,
@@ -122,6 +150,10 @@ impl AccumulatorConfig {
             next_batch_id: 0,
             last_flush_time: tokio::time::Instant::now(),
             pending_count,
+            feedback_rx,
+            feedback_tx,
+            inflight: JoinSet::new(),
+            inflight_count,
         };
 
         (handle, accumulator)
@@ -137,6 +169,7 @@ impl Default for AccumulatorConfig {
             max_batch_size: None,
             max_queue_depth: None,
             flush_empty_batches: false,
+            concurrency_mode: ConcurrencyMode::Serial,
         }
     }
 }
