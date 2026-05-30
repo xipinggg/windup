@@ -60,7 +60,7 @@ async fn main() {
     // 场景1: reply — 提交并等待结果
     println!("=== 场景1: submit_with_reply ===");
     let reply = handle
-        .submit_with_reply("hello-world".into())
+        .submit("hello-world".into())
         .unwrap();
     let result = reply.await.unwrap();
     println!("  结果: {result}");
@@ -68,10 +68,10 @@ async fn main() {
     // 场景2: fire-and-forget + reply 混合
     println!("\n=== 场景2: fire-and-forget + reply 混合 ===");
     for i in 1..=5 {
-        handle.submit(format!("fire-{i}")).unwrap();
+        handle.submit_no_wait(format!("fire-{i}")).unwrap();
     }
     let reply2 = handle
-        .submit_with_reply("mixed-reply".into())
+        .submit("mixed-reply".into())
         .unwrap();
     println!("  结果: {}", reply2.await.unwrap());
 
@@ -86,7 +86,7 @@ async fn main() {
         let h = handle.clone();
         handles.push(tokio::spawn(async move {
             let reply = h
-                .submit_with_reply(format!("task-{i}"))
+                .submit(format!("task-{i}"))
                 .unwrap();
             let result = reply.await.unwrap();
             println!("  task-{i} 结果: {result}");

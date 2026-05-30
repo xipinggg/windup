@@ -31,7 +31,8 @@
 //! );
 //!
 //! let join_handle = tokio::spawn(accumulator.run());
-//! handle.submit(42)?;
+//! let reply = handle.submit(42)?;
+//! let result = reply.await?;  // 拿到处理结果
 //! ```
 //!
 //! # 自适应行为

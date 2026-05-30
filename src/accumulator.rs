@@ -68,11 +68,13 @@ impl<T: Send, R: Send> Clone for AccumulatorHandle<T, R> {
 impl<T: Send, R: Send> AccumulatorHandle<T, R> {
     /// 提交一个 item 到累加器（fire-and-forget，不关心结果）。
     ///
+    /// 如果你需要获取处理结果，请使用 [`submit`](Self::submit)。
+    ///
     /// # Errors
     ///
     /// - [`AccumulatorError::QueueFull`]：超过 `max_queue_depth` 限制。
     /// - [`AccumulatorError::Shutdown`]：累加器已关闭。
-    pub fn submit(&self, item: T) -> Result<(), AccumulatorError> {
+    pub fn submit_no_wait(&self, item: T) -> Result<(), AccumulatorError> {
         let result = self.pending_count.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
@@ -101,13 +103,15 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
             })
     }
 
-    /// 提交一个 item 并返回 [`ReplyHandle`]，`.await` 后拿到处理结果。
+    /// 提交一个 item，返回 [`ReplyHandle`]，`.await` 后拿到处理结果。
+    ///
+    /// 如果不需要结果，可使用 [`submit_no_wait`](Self::submit_no_wait)（fire-and-forget）。
     ///
     /// # Errors
     ///
     /// - [`AccumulatorError::QueueFull`]：超过 `max_queue_depth` 限制。
     /// - [`AccumulatorError::Shutdown`]：累加器已关闭。
-    pub fn submit_with_reply(&self, item: T) -> Result<ReplyHandle<R>, AccumulatorError> {
+    pub fn submit(&self, item: T) -> Result<ReplyHandle<R>, AccumulatorError> {
         let result = self.pending_count.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,

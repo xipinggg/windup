@@ -47,9 +47,9 @@ async fn test_basic_time_flush() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100));
     tokio::spawn(accumulator.run());
 
-    handle.submit(1).unwrap();
-    handle.submit(2).unwrap();
-    handle.submit(3).unwrap();
+    handle.submit_no_wait(1).unwrap();
+    handle.submit_no_wait(2).unwrap();
+    handle.submit_no_wait(3).unwrap();
 
     tick(Duration::from_millis(80)).await;
     assert_eq!(batches.lock().unwrap().len(), 0);
@@ -70,16 +70,16 @@ async fn test_max_batch_size_early_flush() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
     tokio::spawn(accumulator.run());
 
-    handle.submit(1).unwrap();
-    handle.submit(2).unwrap();
-    handle.submit(3).unwrap();
+    handle.submit_no_wait(1).unwrap();
+    handle.submit_no_wait(2).unwrap();
+    handle.submit_no_wait(3).unwrap();
 
     tick(Duration::ZERO).await;
     assert_eq!(batches.lock().unwrap().len(), 1);
     assert_eq!(batches.lock().unwrap()[0].len(), 3);
 
-    handle.submit(4).unwrap();
-    handle.submit(5).unwrap();
+    handle.submit_no_wait(4).unwrap();
+    handle.submit_no_wait(5).unwrap();
     tick(Duration::ZERO).await;
     assert_eq!(batches.lock().unwrap().len(), 1);
 
@@ -94,16 +94,16 @@ async fn test_multiple_time_flushes() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(50));
     tokio::spawn(accumulator.run());
 
-    handle.submit(1).unwrap();
-    handle.submit(2).unwrap();
+    handle.submit_no_wait(1).unwrap();
+    handle.submit_no_wait(2).unwrap();
     tick(Duration::from_millis(60)).await;
 
     let after_first = batches.lock().unwrap().len();
     assert_eq!(after_first, 1, "first flush should have occurred");
 
-    handle.submit(3).unwrap();
-    handle.submit(4).unwrap();
-    handle.submit(5).unwrap();
+    handle.submit_no_wait(3).unwrap();
+    handle.submit_no_wait(4).unwrap();
+    handle.submit_no_wait(5).unwrap();
     tick(Duration::from_millis(60)).await;
 
     let guard = batches.lock().unwrap();
@@ -122,9 +122,9 @@ async fn test_drain_on_close() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
     let jh = tokio::spawn(accumulator.run());
 
-    handle.submit(1).unwrap();
-    handle.submit(2).unwrap();
-    handle.submit(3).unwrap();
+    handle.submit_no_wait(1).unwrap();
+    handle.submit_no_wait(2).unwrap();
+    handle.submit_no_wait(3).unwrap();
 
     drop(handle);
     jh.await.unwrap();
@@ -139,10 +139,10 @@ async fn test_max_queue_depth() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
     tokio::spawn(accumulator.run());
 
-    handle.submit(1).unwrap();
-    handle.submit(2).unwrap();
+    handle.submit_no_wait(1).unwrap();
+    handle.submit_no_wait(2).unwrap();
 
-    let err = handle.submit(3).unwrap_err();
+    let err = handle.submit_no_wait(3).unwrap_err();
     assert!(matches!(err, AccumulatorError::QueueFull { max: 2, .. }));
 
     drop(handle);
@@ -197,7 +197,7 @@ async fn test_multi_producer() {
         let h = handle.clone();
         handles.push(tokio::spawn(async move {
             for i in 0..PER_PRODUCER {
-                h.submit(i).unwrap();
+                h.submit_no_wait(i).unwrap();
             }
         }));
     }
@@ -231,7 +231,7 @@ async fn test_reply_single_result() {
     let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(100));
     tokio::spawn(accumulator.run());
 
-    let reply = handle.submit_with_reply(21).unwrap();
+    let reply = handle.submit(21).unwrap();
     let result = reply.await.unwrap();
     assert_eq!(result, 42);
 
@@ -257,9 +257,9 @@ async fn test_reply_multiple_results() {
     let (handle, accumulator) = config.build(Upper, DefaultMetrics::new(), fixed(200));
     tokio::spawn(accumulator.run());
 
-    let r1 = handle.submit_with_reply("hello".into()).unwrap();
-    let r2 = handle.submit_with_reply("world".into()).unwrap();
-    let r3 = handle.submit_with_reply("rust".into()).unwrap();
+    let r1 = handle.submit("hello".into()).unwrap();
+    let r2 = handle.submit("world".into()).unwrap();
+    let r3 = handle.submit("rust".into()).unwrap();
 
     assert_eq!(r1.await.unwrap(), "HELLO");
     assert_eq!(r2.await.unwrap(), "WORLD");
@@ -282,7 +282,7 @@ async fn test_reply_on_shutdown() {
     let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(10_000));
     let jh = tokio::spawn(accumulator.run());
 
-    let reply = handle.submit_with_reply(10).unwrap();
+    let reply = handle.submit(10).unwrap();
     drop(handle);
 
     // 关闭后 reply 应该返回完成或 shutdown
@@ -309,12 +309,12 @@ async fn test_reply_mixed_fire_and_forget() {
     tokio::spawn(accumulator.run());
 
     // fire-and-forget
-    handle.submit(1).unwrap();
-    handle.submit(2).unwrap();
+    handle.submit_no_wait(1).unwrap();
+    handle.submit_no_wait(2).unwrap();
     // with reply
-    let reply = handle.submit_with_reply(10).unwrap();
+    let reply = handle.submit(10).unwrap();
     // more fire-and-forget
-    handle.submit(3).unwrap();
+    handle.submit_no_wait(3).unwrap();
 
     let result = reply.await.unwrap();
     assert_eq!(result, 20);
@@ -334,8 +334,8 @@ async fn test_concurrent_basic_time_flush() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100));
     tokio::spawn(accumulator.run());
 
-    handle.submit(1).unwrap();
-    handle.submit(2).unwrap();
+    handle.submit_no_wait(1).unwrap();
+    handle.submit_no_wait(2).unwrap();
     tick(Duration::from_millis(150)).await;
 
     let guard = batches.lock().unwrap();
@@ -354,9 +354,9 @@ async fn test_concurrent_drain_on_close() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
     let jh = tokio::spawn(accumulator.run());
 
-    handle.submit(1).unwrap();
-    handle.submit(2).unwrap();
-    handle.submit(3).unwrap();
+    handle.submit_no_wait(1).unwrap();
+    handle.submit_no_wait(2).unwrap();
+    handle.submit_no_wait(3).unwrap();
     drop(handle);
     jh.await.unwrap();
 
@@ -381,7 +381,7 @@ async fn test_concurrent_multi_producer() {
         let h = handle.clone();
         handles.push(tokio::spawn(async move {
             for i in 0..PER_PRODUCER {
-                h.submit(i).unwrap();
+                h.submit_no_wait(i).unwrap();
             }
         }));
     }
@@ -406,9 +406,9 @@ async fn test_concurrent_max_batch_size() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
     tokio::spawn(accumulator.run());
 
-    handle.submit(1).unwrap();
-    handle.submit(2).unwrap();
-    handle.submit(3).unwrap();
+    handle.submit_no_wait(1).unwrap();
+    handle.submit_no_wait(2).unwrap();
+    handle.submit_no_wait(3).unwrap();
     // 达到 max_batch_size，应在后台处理
     tick(Duration::from_millis(50)).await;
 
@@ -455,7 +455,7 @@ async fn test_concurrent_max_inflight_limit() {
 
     // 快速提交多个 item
     for i in 0..5 {
-        handle.submit(i).unwrap();
+        handle.submit_no_wait(i).unwrap();
     }
 
     // 等待足够时间让所有 task 完成
@@ -484,8 +484,8 @@ async fn test_concurrent_with_reply() {
     let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(200));
     tokio::spawn(accumulator.run());
 
-    let r1 = handle.submit_with_reply(10).unwrap();
-    let r2 = handle.submit_with_reply(20).unwrap();
+    let r1 = handle.submit(10).unwrap();
+    let r2 = handle.submit(20).unwrap();
 
     assert_eq!(r1.await.unwrap(), 20);
     assert_eq!(r2.await.unwrap(), 40);
@@ -502,9 +502,9 @@ async fn test_serial_unchanged() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100));
     tokio::spawn(accumulator.run());
 
-    handle.submit(1).unwrap();
-    handle.submit(2).unwrap();
-    handle.submit(3).unwrap();
+    handle.submit_no_wait(1).unwrap();
+    handle.submit_no_wait(2).unwrap();
+    handle.submit_no_wait(3).unwrap();
 
     tick(Duration::from_millis(80)).await;
     assert_eq!(batches.lock().unwrap().len(), 0);

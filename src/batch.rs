@@ -77,10 +77,9 @@ impl<T> Batch<T> {
     }
 }
 
-/// 调用方提交 item 后等待结果的 Future。
+/// 调用方 [`submit`](super::accumulator::AccumulatorHandle::submit) item 后等待结果的 Future。
 ///
-/// 通过 [`AccumulatorHandle::submit_with_reply`](super::accumulator::AccumulatorHandle::submit_with_reply)
-/// 获取，`.await` 后得到对应 item 的处理结果。
+/// `.await` 后得到对应 item 的处理结果。
 ///
 /// 如果累加器在结果返回前关闭， `.await` 返回 `Err(AccumulatorError::Shutdown)`。
 pub struct ReplyHandle<R> {
