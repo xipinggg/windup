@@ -212,7 +212,7 @@ macro_rules! event_if {
 
 ```rust
 // trace.rs
-pub(crate) const SPAN_RUN: &str = "accumulator::run";
+pub(crate) const SPAN_RUN: &str = "run";
 pub(crate) const SPAN_BATCH: &str = "batch";
 pub(crate) const SPAN_ITEM: &str = "item";
 pub(crate) const SPAN_BYPASS: &str = "bypass";
