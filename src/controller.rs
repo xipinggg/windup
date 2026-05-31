@@ -8,8 +8,8 @@ use crate::metrics::MetricsSnapshot;
 /// 每次 flush 后由累加器调用。返回值由累加器的 `[min_window, max_window]`
 /// 做 clamp，控制器无需自行边界检查。
 pub trait WindowController: Send + 'static {
-    /// 读取指标快照，返回调整后的窗口时长。
-    async fn adjust_window(
+    /// 读取指标快照，返回调整后的窗口时长（同步方法）。
+    fn adjust_window(
         &mut self,
         current_window: Duration,
         metrics: &MetricsSnapshot,
@@ -67,7 +67,7 @@ impl AdaptiveController {
 }
 
 impl WindowController for AdaptiveController {
-    async fn adjust_window(
+    fn adjust_window(
         &mut self,
         current_window: Duration,
         metrics: &MetricsSnapshot,
@@ -136,7 +136,7 @@ impl LatencyAdaptiveController {
 }
 
 impl WindowController for LatencyAdaptiveController {
-    async fn adjust_window(
+    fn adjust_window(
         &mut self,
         current_window: Duration,
         metrics: &MetricsSnapshot,
@@ -173,7 +173,7 @@ impl FixedController {
 }
 
 impl WindowController for FixedController {
-    async fn adjust_window(
+    fn adjust_window(
         &mut self,
         _current_window: Duration,
         _metrics: &MetricsSnapshot,
@@ -218,7 +218,7 @@ mod tests {
     async fn adaptive_increases_on_low_utilization() {
         let mut ctrl = ac(0.8, 0.1);
         let current = Duration::from_millis(500);
-        let new = ctrl.adjust_window(current, &snap_util(0.3)).await;
+        let new = ctrl.adjust_window(current, &snap_util(0.3));
         assert!(new > current, "expected window to increase, got {new:?}");
     }
 
@@ -226,7 +226,7 @@ mod tests {
     async fn adaptive_decreases_on_high_utilization() {
         let mut ctrl = ac(0.8, 0.1);
         let current = Duration::from_millis(500);
-        let new = ctrl.adjust_window(current, &snap_util(0.95)).await;
+        let new = ctrl.adjust_window(current, &snap_util(0.95));
         assert!(new < current, "expected window to decrease, got {new:?}");
     }
 
@@ -236,7 +236,7 @@ mod tests {
         // 极高利用率 → factor 变小但不会负
         let new = ctrl
             .adjust_window(Duration::from_millis(200), &snap_util(1.0))
-            .await;
+            ;
         assert!(new < Duration::from_millis(200), "high util should shrink");
     }
 
@@ -244,7 +244,7 @@ mod tests {
     async fn adaptive_idle_unchanged() {
         let mut ctrl = ac(0.8, 0.1);
         let current = Duration::from_millis(500);
-        let new = ctrl.adjust_window(current, &snap_util(0.0)).await;
+        let new = ctrl.adjust_window(current, &snap_util(0.0));
         assert_eq!(new, current, "idle window should not change");
     }
 
@@ -253,7 +253,7 @@ mod tests {
         let mut ctrl = FixedController::new(Duration::from_millis(300));
         let new = ctrl
             .adjust_window(Duration::from_millis(500), &snap_util(1.0))
-            .await;
+            ;
         assert_eq!(new, Duration::from_millis(300));
     }
 
@@ -261,7 +261,7 @@ mod tests {
     async fn adaptive_on_target_unchanged() {
         let mut ctrl = ac(0.8, 0.1);
         let current = Duration::from_millis(500);
-        let new = ctrl.adjust_window(current, &snap_util(0.8)).await;
+        let new = ctrl.adjust_window(current, &snap_util(0.8));
         assert_eq!(new, current);
     }
 
@@ -270,7 +270,7 @@ mod tests {
         let mut ctrl = lc(1.0, 0.1);
         let current = Duration::from_millis(500);
         let snap = snap_latency(Duration::from_millis(100), Duration::from_millis(110));
-        let new = ctrl.adjust_window(current, &snap).await;
+        let new = ctrl.adjust_window(current, &snap);
         assert!(new < current, "slower should decrease, got {new:?}");
     }
 
@@ -279,7 +279,7 @@ mod tests {
         let mut ctrl = lc(1.0, 0.1);
         let current = Duration::from_millis(500);
         let snap = snap_latency(Duration::from_millis(100), Duration::from_millis(90));
-        let new = ctrl.adjust_window(current, &snap).await;
+        let new = ctrl.adjust_window(current, &snap);
         assert!(new > current, "faster should increase, got {new:?}");
     }
 
@@ -288,7 +288,7 @@ mod tests {
         let mut ctrl = lc(1.0, 0.1);
         let current = Duration::from_millis(500);
         let snap = snap_latency(Duration::from_millis(100), Duration::from_millis(100));
-        let new = ctrl.adjust_window(current, &snap).await;
+        let new = ctrl.adjust_window(current, &snap);
         assert_eq!(new, current);
     }
 
@@ -297,7 +297,7 @@ mod tests {
         let mut ctrl = lc(1.0, 0.1);
         let current = Duration::from_millis(500);
         let snap = snap_latency(Duration::ZERO, Duration::from_millis(100));
-        let new = ctrl.adjust_window(current, &snap).await;
+        let new = ctrl.adjust_window(current, &snap);
         assert_eq!(new, current, "first flush should not change window");
     }
 
@@ -307,7 +307,7 @@ mod tests {
         let snap = snap_latency(Duration::from_millis(100), Duration::from_millis(300));
         let new = ctrl
             .adjust_window(Duration::from_millis(200), &snap)
-            .await;
+            ;
         assert!(new < Duration::from_millis(200));
     }
 }

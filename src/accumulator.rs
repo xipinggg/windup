@@ -305,10 +305,12 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
     /// # Errors
     /// - [`AccumulatorError::Timeout`]：等待超时。
     /// - [`AccumulatorError::Shutdown`]：累加器已关闭。
-    pub async fn submit_blocking(
+    pub async fn submit_or_wait(
         &self, item: T, timeout: Duration,
     ) -> Result<ReplyHandle<R>, AccumulatorError> {
-        self.blocking_inner(item, timeout, true).await.map(|opt| opt.expect("with_reply=true"))
+        self.blocking_inner(item, timeout, true)
+            .await
+            .map(|opt| opt.unwrap_or_else(|| unreachable!("blocking_inner(true) always returns Some")))
     }
 
     /// 阻塞发送（fire-and-forget + 阻塞等待）：队列满时等待空位。
@@ -316,14 +318,17 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
     /// # Errors
     /// - [`AccumulatorError::Timeout`]：等待超时。
     /// - [`AccumulatorError::Shutdown`]：累加器已关闭。
-    pub async fn send_blocking(
+    pub async fn send_or_wait(
         &self, item: T, timeout: Duration,
     ) -> Result<(), AccumulatorError> {
         self.blocking_inner(item, timeout, false).await.map(|_| ())
     }
 }
 
-/// 批累加器核心。
+/// 批累加器运行时。
+///
+/// 由 [`AccumulatorConfig::build`] 创建，调用 [`run`](Self::run) 启动主循环。
+/// 用户通常无需直接接触此类型——通过 [`AccumulatorHandle`] 操作即可。
 pub struct BatchAccumulator<T, R, P, M, C> {
     pub(crate) config: AccumulatorConfig,
     pub(crate) processor: Arc<P>,
@@ -541,9 +546,9 @@ where
     }
 
     /// 窗口调整：快照 metrics → controller → clamp → 日志 → 写入共享状态。
-    async fn adjust_window_after_flush(&mut self) {
+    fn adjust_window_after_flush(&mut self) {
         let snapshot = self.metrics.snapshot();
-        let new_window = self.controller.adjust_window(self.current_window(), &snapshot).await;
+        let new_window = self.controller.adjust_window(self.current_window(), &snapshot);
         let clamped = new_window.clamp(self.config.min_window, self.config.max_window);
         if clamped != self.current_window() {
             event_at!(Level::INFO, &self.config.tracing_level,
@@ -762,7 +767,7 @@ where
                 let time_since_last_flush = self.last_flush_time.elapsed();
                 self.flush_inner(time_since_last_flush).await;
 
-                self.adjust_window_after_flush().await;
+                self.adjust_window_after_flush();
                 true
             }
             ConcurrencyMode::Concurrent { max_inflight } => {
@@ -847,7 +852,7 @@ where
             total_weight: self.config.max_batch_weight.map(|_| total_weight),
         };
 
-        self.metrics.record_flush(&info).await;
+        self.metrics.record_flush(&info);
         self.stats.record_flush(execution_time);
 
         self.last_flush_time = Instant::now();
@@ -855,10 +860,10 @@ where
 
     /// 处理并发模式下的后台任务反馈。
     async fn handle_feedback(&mut self, info: FlushInfo) {
-        self.metrics.record_flush(&info).await;
+        self.metrics.record_flush(&info);
         self.stats.record_flush(info.execution_time);
         self.last_flush_time = Instant::now();
-        self.adjust_window_after_flush().await;
+        self.adjust_window_after_flush();
 
         // 若 buffer 有积压，通知主循环 flush
         if !self.buffer.is_empty() {

@@ -1,7 +1,7 @@
 //! 可观测性统计模块。
 //!
-//! 通过 [`AccumulatorConfig::with_stats`](super::config::AccumulatorConfig::with_stats)
-//! 开启后，可实时获取累加器的运行统计快照。
+//! 统计始终开启，可通过 [`AccumulatorHandle::stats`]
+//! 和 [`AccumulatorHandle::health`] 获取运行快照和健康状态。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;

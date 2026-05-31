@@ -664,10 +664,10 @@ mod tracing_tests {
     }
 }
 
-// ─── submit_blocking / send_blocking ───
+// ─── submit_or_wait / send_or_wait ───
 
 #[tokio::test]
-async fn test_submit_blocking_waits_for_slot() {
+async fn test_submit_or_wait_waits_for_slot() {
     let config = AccumulatorConfig::new(
         Duration::from_millis(200),
         Duration::from_millis(50),
@@ -690,7 +690,7 @@ async fn test_submit_blocking_waits_for_slot() {
     // 阻塞提交：应该等待 slot 释放后成功
     let h2 = handle.clone();
     let blocking_result = tokio::spawn(async move {
-        h2.submit_blocking(2, Duration::from_secs(5)).await
+        h2.submit_or_wait(2, Duration::from_secs(5)).await
     });
 
     // 稍等后触发 flush 释放 slot
@@ -706,7 +706,7 @@ async fn test_submit_blocking_waits_for_slot() {
 }
 
 #[tokio::test]
-async fn test_send_blocking_waits() {
+async fn test_send_or_wait_waits() {
     let config = AccumulatorConfig::new(
         Duration::from_millis(200),
         Duration::from_millis(50),
@@ -726,10 +726,10 @@ async fn test_send_blocking_waits() {
     // 占满队列
     handle.send(1).unwrap();
 
-    // send_blocking 应等待 slot
+    // send_or_wait 应等待 slot
     let h2 = handle.clone();
     let blocking_task = tokio::spawn(async move {
-        h2.send_blocking(2, Duration::from_secs(5)).await
+        h2.send_or_wait(2, Duration::from_secs(5)).await
     });
 
     tokio::time::sleep(Duration::from_millis(300)).await;

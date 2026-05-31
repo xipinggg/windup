@@ -4,7 +4,7 @@ use crate::batch::FlushInfo;
 use crate::error::AccumulatorError;
 
 /// EMA 平滑系数的默认值。
-pub const DEFAULT_EMA_ALPHA: f64 = 0.3;
+pub(crate) const DEFAULT_EMA_ALPHA: f64 = 0.3;
 
 /// 指标快照，供 [`WindowController`](super::controller::WindowController) 查询。
 #[derive(Debug, Clone)]
@@ -26,8 +26,8 @@ pub struct MetricsSnapshot {
 /// 实现者负责维护内部状态（如 EMA 平滑值），并通过
 /// [`snapshot`](Self::snapshot) 暴露给窗口控制器。
 pub trait MetricsCollector: Send + 'static {
-    /// 每次 flush 完成后调用。
-    async fn record_flush(&mut self, info: &FlushInfo);
+    /// 每次 flush 完成后调用（同步方法）。
+    fn record_flush(&mut self, info: &FlushInfo);
 
     /// 返回当前指标快照（同步，不阻塞）。
     fn snapshot(&self) -> MetricsSnapshot;
@@ -85,7 +85,7 @@ impl Default for DefaultMetrics {
 }
 
 impl MetricsCollector for DefaultMetrics {
-    async fn record_flush(&mut self, info: &FlushInfo) {
+    fn record_flush(&mut self, info: &FlushInfo) {
         let actual_util = if let Some(max) = info.max_batch_size {
             if max == 0 {
                 0.0

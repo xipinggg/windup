@@ -2,6 +2,12 @@
 name = "draft"
 version = "0.1.0"
 edition = "2024"
+description = "自适应时间窗口批处理累加器 — 积攒 item 后整批交付，窗口基于指标自动调整"
+license = "MIT"
+repository = "https://github.com/fxp/draft"
+keywords = ["batch", "accumulator", "adaptive", "batching", "tokio"]
+categories = ["asynchronous", "concurrency"]
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["time", "sync", "macros", "rt"] }

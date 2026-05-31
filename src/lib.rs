@@ -1,7 +1,8 @@
 //! 自适应时间窗口批处理累加器。
 //!
-//! 本库提供了一个通用的批处理框架，可在可配置的时间窗口内积攒 item，
-//! 到期后整批交付用户定义的处理器。时间窗口基于自定义指标自适应调整。
+//! 在可配置的时间窗口内积攒 item，到期后整批交付用户定义的处理器。
+//! 时间窗口基于批利用率或执行延迟**自适应调整**。支持串行/并发处理、
+//! 优先级、可失败处理器、tracing 可观测性。
 //!
 //! # 快速开始
 //!
@@ -24,13 +25,12 @@
 //! )?
 //! .with_max_batch_size(100);
 //!
-//! let (handle, accumulator) = config.build(
+//! let (handle, _jh) = config.build_and_spawn(
 //!     MyProcessor,
 //!     DefaultMetrics::new(),
 //!     AdaptiveController::new(0.8, 0.1)?,
 //! );
 //!
-//! let join_handle = tokio::spawn(accumulator.run());
 //! let reply = handle.submit(42)?;
 //! let result = reply.await?;  // 拿到处理结果
 //! ```
@@ -56,7 +56,7 @@
 //! | 优先级 | Normal / High 两级，高优先级插队 |
 //! | 超时控制 | item 级别 TTL + drain 超时 |
 //! | 权重追踪 | 按 item "重量" 触发提前 flush |
-//! | 阻塞提交 | 队列满时等待空位（`submit_blocking`） |
+//! | 阻塞提交 | 队列满时等待空位（`submit_or_wait`） |
 //! | bypass | 跳过批处理，直接交付 |
 //! | 可观测性 | tracing span/event + stats 快照 + health 检查 |
 //! | 零开销抽象 | tracing feature 可关闭，编译器优化掉所有桩代码 |
@@ -94,7 +94,10 @@ pub mod trace;
 /// 常用类型和 trait 的批量导入。
 pub mod prelude {
     pub use crate::accumulator::AccumulatorHandle;
-    pub use crate::batch::{Batch, BatchProcessor, Priority, ReplyHandle, SubmitOptions};
+    pub use crate::batch::{
+        Batch, BatchProcessor, FlushInfo, Priority, ReplyHandle, SubmitOptions,
+        TryBatchProcessor,
+    };
     pub use crate::config::{AccumulatorConfig, ConcurrencyMode};
     pub use crate::controller::{
         AdaptiveController, FixedController, LatencyAdaptiveController, WindowController,

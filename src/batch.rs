@@ -21,6 +21,33 @@ pub trait BatchProcessor<T: Send, R: Send = ()>: Send + 'static {
     fn process(&self, batch: Batch<T>) -> impl Future<Output = Vec<R>> + Send;
 }
 
+/// 可失败的批处理器：每个 item 可能成功或失败。
+///
+/// 与 [`BatchProcessor`] 不同，此 trait 允许对批次中每个 item 返回独立的
+/// `Result<R, E>`，适用于批量写入数据库、批量 HTTP 调用等可能部分失败的场景。
+///
+/// 同时提供从 [`BatchProcessor`] 的 blanket 实现：任何不可失败处理器自动实现
+/// `TryBatchProcessor`，错误类型为 [`std::convert::Infallible`]。
+pub trait TryBatchProcessor<T: Send, R: Send = ()>: Send + 'static {
+    /// 错误类型。
+    type Error: Send + 'static;
+
+    /// 处理一个批次，按 item 顺序返回每个 item 的 `Result<R, Self::Error>`。
+    fn try_process(
+        &self,
+        batch: Batch<T>,
+    ) -> impl Future<Output = Vec<Result<R, Self::Error>>> + Send;
+}
+
+/// 任何不可失败的 BatchProcessor 自动成为 TryBatchProcessor。
+impl<T: Send, R: Send, P: BatchProcessor<T, R> + Sync> TryBatchProcessor<T, R> for P {
+    type Error = std::convert::Infallible;
+
+    async fn try_process(&self, batch: Batch<T>) -> Vec<Result<R, std::convert::Infallible>> {
+        self.process(batch).await.into_iter().map(Ok).collect()
+    }
+}
+
 /// 一个待处理的批次。
 ///
 /// 包含在时间窗口内收集到的所有 item。
@@ -101,6 +128,9 @@ impl<T> Batch<T> {
 /// 调用方 [`submit`](super::accumulator::AccumulatorHandle::submit) item 后等待结果的 Future。
 ///
 /// `.await` 后得到对应 item 的处理结果。
+///
+/// **丢弃行为**：丢弃未 `.await` 的 `ReplyHandle` 不会泄漏资源或 panic。
+/// item 仍会被正常处理，只是结果被丢弃（oneshot receiver 关闭后 sender 静默失败）。
 ///
 /// 可能返回的错误：
 /// - [`AccumulatorError::Shutdown`]：累加器在结果返回前关闭。

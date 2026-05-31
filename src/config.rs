@@ -170,6 +170,29 @@ impl AccumulatorConfig {
         self
     }
 
+    /// 消费配置，构建并启动累加器。
+    ///
+    /// 等价于 `build()` + `tokio::spawn(accumulator.run())`。
+    /// 返回 `(Handle, JoinHandle)`，`JoinHandle` 在 accumulator 退出时完成。
+    #[allow(clippy::type_complexity)]
+    pub fn build_and_spawn<T, R, P, M, C>(
+        self,
+        processor: P,
+        metrics: M,
+        controller: C,
+    ) -> (AccumulatorHandle<T, R>, tokio::task::JoinHandle<()>)
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+        P: BatchProcessor<T, R> + Sync,
+        M: MetricsCollector,
+        C: WindowController,
+    {
+        let (handle, accumulator) = self.build(processor, metrics, controller);
+        let join = tokio::spawn(accumulator.run());
+        (handle, join)
+    }
+
     /// 消费配置，构建 [`AccumulatorHandle`] 和 [`BatchAccumulator`]（无权重追踪）。
     ///
     /// 等价于 `build_with_weight(processor, metrics, controller, |_| 1)`。
