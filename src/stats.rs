@@ -48,6 +48,12 @@ pub struct StatsSnapshot {
     pub current_weight: usize,
     /// 当前时间窗口大小。
     pub current_window: Duration,
+    /// 队列等待时间 p50（中位数）。
+    pub p50_queue_wait: Duration,
+    /// 队列等待时间 p99。
+    pub p99_queue_wait: Duration,
+    /// 队列等待时间平均值。
+    pub avg_queue_wait: Duration,
     /// flush 执行时间 p50（中位数）。
     pub p50_latency: Duration,
     /// flush 执行时间 p99。
@@ -67,6 +73,8 @@ pub(crate) struct AccumulatorStats {
     pub total_rejected: AtomicU64,
     /// 延迟样本，最多 MAX_LATENCY_SAMPLES 条。
     latency_samples: Mutex<Vec<Duration>>,
+    /// 队列等待时间样本。
+    wait_samples: Mutex<Vec<Duration>>,
 }
 
 impl AccumulatorStats {
@@ -79,12 +87,21 @@ impl AccumulatorStats {
             total_bypassed: AtomicU64::new(0),
             total_rejected: AtomicU64::new(0),
             latency_samples: Mutex::new(Vec::with_capacity(MAX_LATENCY_SAMPLES)),
+            wait_samples: Mutex::new(Vec::with_capacity(MAX_LATENCY_SAMPLES)),
         }
     }
 
     /// 记录一次 submit 调用。
     pub fn record_submit(&self) {
         self.total_submitted.fetch_add(1, Ordering::Release);
+    }
+
+    /// 记录一次队列等待时间。
+    pub fn record_wait(&self, wait: Duration) {
+        if let Ok(mut samples) = self.wait_samples.lock() {
+            if samples.len() >= MAX_LATENCY_SAMPLES { samples.remove(0); }
+            samples.push(wait);
+        }
     }
 
     /// 记录一次 flush 完成（含执行耗时）。
@@ -123,13 +140,19 @@ impl AccumulatorStats {
         current_weight: usize,
         current_window: Duration,
     ) -> StatsSnapshot {
-        let samples: Vec<Duration> = self
+        let latency_samples: Vec<Duration> = self
             .latency_samples
             .lock()
             .map(|s| s.clone())
             .unwrap_or_default();
+        let wait_samples: Vec<Duration> = self
+            .wait_samples
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
 
-        let (p50, p99, avg, max) = percentiles(&samples);
+        let (p50, p99, avg, max) = percentiles(&latency_samples);
+        let (wp50, wp99, wavg, _) = percentiles(&wait_samples);
 
         StatsSnapshot {
             total_submitted: self.total_submitted.load(Ordering::Acquire),
@@ -142,6 +165,9 @@ impl AccumulatorStats {
             inflight_count,
             current_weight,
             current_window,
+            p50_queue_wait: wp50,
+            p99_queue_wait: wp99,
+            avg_queue_wait: wavg,
             p50_latency: p50,
             p99_latency: p99,
             avg_latency: avg,

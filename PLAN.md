@@ -72,6 +72,8 @@ pub trait WindowController: Send + 'static {
 | `FixedController` | 无 | 永远返回固定窗口 |
 | `AdaptiveController` | `batch_size / max_batch_size` | `factor = 1.0 + rate * (target - util)` |
 | `LatencyAdaptiveController` | `exec_time / EMA基线` | `factor = 1.0 + rate * (target - ratio)` |
+| `PIDController` | `batch_size / max_batch_size` | PID 控制算法消除稳态误差和振荡 |
+| `BackoffController` | 连续满批/空闲计数 | 满批时指数退避放大窗口，空闲时缓慢回缩 |
 | 自定义 | 任意 | 实现 `WindowController` trait |
 
 ### AdaptiveController
@@ -97,9 +99,20 @@ let config = AccumulatorConfig::new(200ms, 50ms, 5s)
 ## AccumulatorHandle API
 
 ```rust
-handle.submit(item)    // 提交 item，可能返回 QueueFull 或 Shutdown
-handle.flush_now()     // 手动触发立即 flush（非阻塞）
-handle.pending_count() // 当前待处理数
+handle.send(item)              // fire-and-forget
+handle.submit(item)            // 提交并获取 ReplyHandle
+handle.submit_with(item, opts) // 带优先级/超时
+handle.submit_or_wait(item, t) // 阻塞等待
+handle.send_or_wait(item, t)   // fire-and-forget + 阻塞等待
+handle.bypass(item)            // 跳过批处理
+handle.flush_now()             // 手动触发立即 flush
+handle.pending_count()         // 当前待处理数
+handle.pause()                 // 暂停 flush（继续缓冲）
+handle.resume()                // 恢复 flush
+handle.is_paused()             // 是否已暂停
+handle.cancel()                // 触发优雅关闭
+handle.stats()                 // 统计快照（含队列等待时间）
+handle.health()                // 健康状态
 ```
 
 ## 主循环 (select! biased)

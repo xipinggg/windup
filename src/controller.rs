@@ -182,6 +182,42 @@ impl WindowController for FixedController {
     }
 }
 
+/// PID 自适应窗口控制器。
+pub struct PIDController { pub target: f64, pub kp: f64, pub ki: f64, pub kd: f64, integral: f64, prev_error: f64 }
+impl PIDController {
+    pub fn new(target: f64, kp: f64, ki: f64, kd: f64) -> Result<Self, AccumulatorError> {
+        if !(0.0..=1.0).contains(&target) { return Err(AccumulatorError::InvalidConfig { reason: "target out of [0,1]".into() }); }
+        Ok(Self { target, kp, ki, kd, integral: 0.0, prev_error: 0.0 })
+    }
+}
+impl WindowController for PIDController {
+    fn adjust_window(&mut self, current: Duration, metrics: &MetricsSnapshot) -> Duration {
+        if metrics.batch_utilization_rate == 0.0 { return current; }
+        let error = self.target - metrics.batch_utilization_rate;
+        self.integral = (self.integral + error).clamp(-5.0, 5.0);
+        let derivative = error - self.prev_error; self.prev_error = error;
+        let factor = 1.0 + self.kp * error + self.ki * self.integral + self.kd * derivative;
+        Duration::from_secs_f64((current.as_secs_f64() * factor).max(0.0))
+    }
+}
+
+/// 指数退避窗口控制器：满批时指数放大，空闲时缓慢回缩。
+pub struct BackoffController { min_window: Duration, max_window: Duration, factor: f64, full: u64, empty: u64 }
+impl BackoffController {
+    pub fn new(min: Duration, max: Duration, factor: f64) -> Self {
+        Self { min_window: min, max_window: max, factor, full: 0, empty: 0 }
+    }
+}
+impl WindowController for BackoffController {
+    fn adjust_window(&mut self, current: Duration, metrics: &MetricsSnapshot) -> Duration {
+        if metrics.batch_utilization_rate >= 0.95 { self.full += 1; self.empty = 0;
+            current.mul_f64(self.factor.powi(self.full as i32)).clamp(self.min_window, self.max_window)
+        } else if metrics.batch_utilization_rate == 0.0 && metrics.queue_depth == 0 { self.empty += 1; self.full = 0;
+            if self.empty >= 3 { Duration::from_secs_f64((current.as_secs_f64() / self.factor).max(self.min_window.as_secs_f64())) } else { current }
+        } else { self.full = 0; self.empty = 0; current }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

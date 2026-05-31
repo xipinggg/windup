@@ -51,14 +51,17 @@
 //!
 //! | 特性 | 说明 |
 //! |------|------|
-//! | 自适应窗口 | 基于利用率或延迟自动调整 |
+//! | 自适应窗口 | 5 种控制器：Fixed / Adaptive / Latency / PID / Backoff |
 //! | 串行/并发 | 两种处理模式 |
 //! | 优先级 | Normal / High 两级，高优先级插队 |
+//! | 可失败处理器 | `TryBatchProcessor` 逐项返回 `Result<R, E>` |
 //! | 超时控制 | item 级别 TTL + drain 超时 |
 //! | 权重追踪 | 按 item "重量" 触发提前 flush |
 //! | 阻塞提交 | 队列满时等待空位（`submit_or_wait`） |
+//! | 暂停/恢复 | `pause()`/`resume()` 缓冲不 flush + `cancel()` 优雅关闭 |
 //! | bypass | 跳过批处理，直接交付 |
-//! | 可观测性 | tracing span/event + stats 快照 + health 检查 |
+//! | 恐慌恢复 | processor panic 被隔离，不影响 accumulator |
+//! | 可观测性 | tracing + stats 快照 + health + 队列等待时间 |
 //! | 零开销抽象 | tracing feature 可关闭，编译器优化掉所有桩代码 |
 //!
 //! # 选择处理器
@@ -100,7 +103,8 @@ pub mod prelude {
     };
     pub use crate::config::{AccumulatorConfig, ConcurrencyMode};
     pub use crate::controller::{
-        AdaptiveController, FixedController, LatencyAdaptiveController, WindowController,
+        AdaptiveController, BackoffController, FixedController,
+        LatencyAdaptiveController, PIDController, WindowController,
     };
     pub use crate::error::AccumulatorError;
     pub use crate::metrics::{

@@ -143,9 +143,36 @@ println!("接受中: {}, 队列利用率: {:.1}%, 拒绝: {}",
 | 控制器 | 策略 | 适用场景 |
 |--------|------|----------|
 | `FixedController` | 永远返回固定窗口 | 不需要自适应 |
-| `AdaptiveController` | 利用率低→窗口增大，高→缩小 | 以吞吐量为目标 |
-| `LatencyAdaptiveController` | 执行慢→窗口缩小，快→增大 | 以延迟为目标 |
+| `AdaptiveController` | 利用率低→增大，高→缩小 | 吞吐优先 |
+| `LatencyAdaptiveController` | 执行慢→缩小，快→增大 | 延迟优先 |
+| `PIDController` | PID 算法消除稳态误差和振荡 | 精确控制 |
+| `BackoffController` | 满批指数退避，空闲缓慢回缩 | 突发流量 |
 | 自定义 | 实现 `WindowController` | 任意策略 |
+
+### 运行控制
+
+```rust
+handle.pause();                   // 暂停 flush（继续缓冲）
+handle.resume();                  // 恢复 flush
+assert!(handle.is_paused());      // 检查暂停状态
+handle.cancel();                  // 触发优雅关闭
+```
+
+### 可观测性
+
+```rust
+let stats = handle.stats();
+// StatsSnapshot 新增:
+stats.p50_queue_wait              // 队列等待时间 p50
+stats.p99_queue_wait              // 队列等待时间 p99
+stats.avg_queue_wait              // 队列平均等待时间
+
+// 健康检查
+let health = handle.health();
+health.is_accepting               // 是否仍在接收
+health.queue_utilization          // 队列利用率 0.0~1.0
+health.total_rejected             // 累计拒绝次数
+```
 
 ## 安装
 

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -34,6 +34,10 @@ pub(crate) struct SharedState {
     pub current_window: RwLock<Duration>,
     /// 并发模式下的飞行中批次数。
     pub inflight_count: AtomicUsize,
+    /// 累加器已被取消（外部信号触发 drain）。
+    pub cancelled: AtomicBool,
+    /// 累加器已暂停（缓冲 item 但不 flush）。
+    pub paused: AtomicBool,
 }
 
 impl SharedState {
@@ -41,6 +45,8 @@ impl SharedState {
         Self {
             current_window: RwLock::new(initial_window),
             inflight_count: AtomicUsize::new(0),
+            cancelled: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
         }
     }
 }
@@ -79,8 +85,9 @@ pub(crate) struct ChannelItem<T, R> {
     /// 优先级。
     pub priority: Priority,
     /// 调用方 submit 时的 span，用于跨 channel 传播上下文。
-    /// feature 关闭时为零大小类型，编译器优化掉。
     pub parent_span: crate::trace::MaybeSpan,
+    /// 提交时刻，用于计算队列等待时间。
+    pub submitted_at: Instant,
 }
 
 /// 向累加器提交 item 的句柄。
@@ -127,7 +134,7 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
     ) -> Result<(), AccumulatorError> {
         self.acquire_slot()?;
         self.sender
-            .send(ChannelItem { value, deadline, reply, priority, parent_span: crate::trace::current_span() })
+            .send(ChannelItem { value, deadline, reply, priority, parent_span: crate::trace::current_span(), submitted_at: Instant::now() })
             .map_err(|_| { self.pending_count.fetch_sub(1, Ordering::Release); AccumulatorError::Shutdown })?;
         self.stats.record_submit();
         Ok(())
@@ -146,7 +153,7 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
                     } else { (None, None) };
                     match self.sender.send(ChannelItem {
                         value: item, deadline: None, reply: tx,
-                        priority: Priority::Normal, parent_span: crate::trace::current_span(),
+                        priority: Priority::Normal, parent_span: crate::trace::current_span(), submitted_at: Instant::now(),
                     }) {
                         Ok(()) => { self.stats.record_submit(); return Ok(reply); }
                         Err(_) => { self.pending_count.fetch_sub(1, Ordering::Release); return Err(AccumulatorError::Shutdown); }
@@ -265,6 +272,33 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
             inflight_count: self.shared.inflight_count.load(Ordering::Acquire),
             total_rejected: self.stats.total_rejected.load(Ordering::Acquire),
         }
+    }
+
+    /// 取消累加器：触发 drain 后退出。
+    ///
+    /// 等价于 drop(handle)，但可提前触发关闭而不等待所有 Handle 被 drop。
+    pub fn cancel(&self) {
+        self.shared.cancelled.store(true, Ordering::Release);
+        self.flush_notify.notify_one();
+    }
+
+    /// 暂停累加器：继续接收 item 但不触发 flush。
+    ///
+    /// timer 到期、达到 max_batch_size 等均被抑制。高优先级 item 仍会触发 flush。
+    /// 用于速率限制或优雅降级场景。
+    pub fn pause(&self) {
+        self.shared.paused.store(true, Ordering::Release);
+    }
+
+    /// 恢复累加器：重新允许 flush。
+    pub fn resume(&self) {
+        self.shared.paused.store(false, Ordering::Release);
+        self.flush_notify.notify_one(); // 触发一次检查
+    }
+
+    /// 累加器当前是否处于暂停状态。
+    pub fn is_paused(&self) -> bool {
+        self.shared.paused.load(Ordering::Acquire)
     }
 
     /// 绕过批处理，直接交付处理器。
@@ -407,6 +441,10 @@ where
         let mut running = true;
 
         while running {
+            // 检查取消信号
+            if self.shared.cancelled.load(Ordering::Acquire) {
+                break;
+            }
             // 非阻塞 drain bypass，限制每轮数量防止饿死 select!
             let mut bypass_count = 0;
             while bypass_count < self.config.drain_batch_limit {
@@ -468,6 +506,8 @@ where
                             self.pending_count.fetch_sub(1, Ordering::Release);
                             // 唤醒一个阻塞的 submit 等待者
                             self.queue_notify.notify_one();
+                            // 记录队列等待时间
+                            self.stats.record_wait(ch.submitted_at.elapsed());
 
                             // 检查刚提交的 item 是否已过期
                             if let Some(dl) = ch.deadline
@@ -556,6 +596,19 @@ where
                 new_ms = clamped.as_millis() as u64, "窗口调整");
         }
         self.set_current_window(clamped);
+    }
+
+    /// 通过 spawn 隔离 processor panic。panic 时记录错误并返回空 Vec。
+    async fn process_safe(tracing_level: crate::trace::TraceLevel, processor: Arc<P>, batch: Batch<T>) -> Vec<R> {
+        let handle = tokio::spawn(async move { processor.process(batch).await });
+        match handle.await {
+            Ok(results) => results,
+            Err(e) => {
+                let msg = if e.is_panic() { "processor panic" } else { "processor 被取消" };
+                event_at!(Level::ERROR, &tracing_level, error = msg, "processor 异常");
+                Vec::new()
+            }
+        }
     }
 
     /// 发送结果到 oneshot 通道（静默忽略 receiver 已关闭）。
@@ -757,7 +810,10 @@ where
     ///
     /// 返回 `true` 表示已执行 flush（或空批次跳过），`false` 表示并发满被跳过。
     async fn flush_batch(&mut self) -> bool {
-        if self.buffer.is_empty() && !self.config.flush_empty_batches {
+        // paused 时跳过 timer 触发的空批次，但允许手动 flush
+        if self.buffer.is_empty()
+            && (!self.config.flush_empty_batches || self.shared.paused.load(Ordering::Acquire))
+        {
             self.last_flush_time = Instant::now();
             return true;
         }
@@ -804,7 +860,7 @@ where
 
         let batch = Batch::with_context(items, batch_id, self.current_window(), 0);
         let proc_start = Instant::now();
-        let results = self.processor.process(batch).await;
+        let results = Self::process_safe(self.config.tracing_level, Arc::clone(&self.processor), batch).await;
         let execution_time = proc_start.elapsed();
 
         // 长度校验：processor 约定返回与 batch 等长的结果
@@ -964,6 +1020,7 @@ where
                 reply: ch.reply,
                 priority: ch.priority,
                 parent_span: ch.parent_span,
+                submitted_at: ch.submitted_at,
             });
         }
 
