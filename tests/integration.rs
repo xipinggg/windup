@@ -3,6 +3,15 @@ use std::time::Duration;
 
 use draft::prelude::*;
 
+/// 测试用处理器：将 i32 转为 String。
+struct StringProcessor;
+
+impl BatchProcessor<i32, String> for StringProcessor {
+    async fn process(&self, batch: Batch<i32>) -> Vec<String> {
+        batch.items().iter().map(|i| format!("y-{i}")).collect()
+    }
+}
+
 type Batches<T> = Arc<Mutex<Vec<Batch<T>>>>;
 
 struct MockProcessor<T: Send> {
@@ -47,9 +56,9 @@ async fn test_basic_time_flush() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100));
     tokio::spawn(accumulator.run());
 
-    handle.submit_no_wait(1).unwrap();
-    handle.submit_no_wait(2).unwrap();
-    handle.submit_no_wait(3).unwrap();
+    handle.send(1).unwrap();
+    handle.send(2).unwrap();
+    handle.send(3).unwrap();
 
     tick(Duration::from_millis(80)).await;
     assert_eq!(batches.lock().unwrap().len(), 0);
@@ -70,16 +79,16 @@ async fn test_max_batch_size_early_flush() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
     tokio::spawn(accumulator.run());
 
-    handle.submit_no_wait(1).unwrap();
-    handle.submit_no_wait(2).unwrap();
-    handle.submit_no_wait(3).unwrap();
+    handle.send(1).unwrap();
+    handle.send(2).unwrap();
+    handle.send(3).unwrap();
 
     tick(Duration::ZERO).await;
     assert_eq!(batches.lock().unwrap().len(), 1);
     assert_eq!(batches.lock().unwrap()[0].len(), 3);
 
-    handle.submit_no_wait(4).unwrap();
-    handle.submit_no_wait(5).unwrap();
+    handle.send(4).unwrap();
+    handle.send(5).unwrap();
     tick(Duration::ZERO).await;
     assert_eq!(batches.lock().unwrap().len(), 1);
 
@@ -94,16 +103,16 @@ async fn test_multiple_time_flushes() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(50));
     tokio::spawn(accumulator.run());
 
-    handle.submit_no_wait(1).unwrap();
-    handle.submit_no_wait(2).unwrap();
+    handle.send(1).unwrap();
+    handle.send(2).unwrap();
     tick(Duration::from_millis(60)).await;
 
     let after_first = batches.lock().unwrap().len();
     assert_eq!(after_first, 1, "first flush should have occurred");
 
-    handle.submit_no_wait(3).unwrap();
-    handle.submit_no_wait(4).unwrap();
-    handle.submit_no_wait(5).unwrap();
+    handle.send(3).unwrap();
+    handle.send(4).unwrap();
+    handle.send(5).unwrap();
     tick(Duration::from_millis(60)).await;
 
     let guard = batches.lock().unwrap();
@@ -122,9 +131,9 @@ async fn test_drain_on_close() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
     let jh = tokio::spawn(accumulator.run());
 
-    handle.submit_no_wait(1).unwrap();
-    handle.submit_no_wait(2).unwrap();
-    handle.submit_no_wait(3).unwrap();
+    handle.send(1).unwrap();
+    handle.send(2).unwrap();
+    handle.send(3).unwrap();
 
     drop(handle);
     jh.await.unwrap();
@@ -139,10 +148,10 @@ async fn test_max_queue_depth() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
     tokio::spawn(accumulator.run());
 
-    handle.submit_no_wait(1).unwrap();
-    handle.submit_no_wait(2).unwrap();
+    handle.send(1).unwrap();
+    handle.send(2).unwrap();
 
-    let err = handle.submit_no_wait(3).unwrap_err();
+    let err = handle.send(3).unwrap_err();
     assert!(matches!(err, AccumulatorError::QueueFull { max: 2, .. }));
 
     drop(handle);
@@ -197,7 +206,7 @@ async fn test_multi_producer() {
         let h = handle.clone();
         handles.push(tokio::spawn(async move {
             for i in 0..PER_PRODUCER {
-                h.submit_no_wait(i).unwrap();
+                h.send(i).unwrap();
             }
         }));
     }
@@ -309,12 +318,12 @@ async fn test_reply_mixed_fire_and_forget() {
     tokio::spawn(accumulator.run());
 
     // fire-and-forget
-    handle.submit_no_wait(1).unwrap();
-    handle.submit_no_wait(2).unwrap();
+    handle.send(1).unwrap();
+    handle.send(2).unwrap();
     // with reply
     let reply = handle.submit(10).unwrap();
     // more fire-and-forget
-    handle.submit_no_wait(3).unwrap();
+    handle.send(3).unwrap();
 
     let result = reply.await.unwrap();
     assert_eq!(result, 20);
@@ -334,8 +343,8 @@ async fn test_concurrent_basic_time_flush() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100));
     tokio::spawn(accumulator.run());
 
-    handle.submit_no_wait(1).unwrap();
-    handle.submit_no_wait(2).unwrap();
+    handle.send(1).unwrap();
+    handle.send(2).unwrap();
     tick(Duration::from_millis(150)).await;
 
     let guard = batches.lock().unwrap();
@@ -354,9 +363,9 @@ async fn test_concurrent_drain_on_close() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
     let jh = tokio::spawn(accumulator.run());
 
-    handle.submit_no_wait(1).unwrap();
-    handle.submit_no_wait(2).unwrap();
-    handle.submit_no_wait(3).unwrap();
+    handle.send(1).unwrap();
+    handle.send(2).unwrap();
+    handle.send(3).unwrap();
     drop(handle);
     jh.await.unwrap();
 
@@ -381,7 +390,7 @@ async fn test_concurrent_multi_producer() {
         let h = handle.clone();
         handles.push(tokio::spawn(async move {
             for i in 0..PER_PRODUCER {
-                h.submit_no_wait(i).unwrap();
+                h.send(i).unwrap();
             }
         }));
     }
@@ -406,9 +415,9 @@ async fn test_concurrent_max_batch_size() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
     tokio::spawn(accumulator.run());
 
-    handle.submit_no_wait(1).unwrap();
-    handle.submit_no_wait(2).unwrap();
-    handle.submit_no_wait(3).unwrap();
+    handle.send(1).unwrap();
+    handle.send(2).unwrap();
+    handle.send(3).unwrap();
     // 达到 max_batch_size，应在后台处理
     tick(Duration::from_millis(50)).await;
 
@@ -455,7 +464,7 @@ async fn test_concurrent_max_inflight_limit() {
 
     // 快速提交多个 item
     for i in 0..5 {
-        handle.submit_no_wait(i).unwrap();
+        handle.send(i).unwrap();
     }
 
     // 等待足够时间让所有 task 完成
@@ -502,9 +511,9 @@ async fn test_serial_unchanged() {
     let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100));
     tokio::spawn(accumulator.run());
 
-    handle.submit_no_wait(1).unwrap();
-    handle.submit_no_wait(2).unwrap();
-    handle.submit_no_wait(3).unwrap();
+    handle.send(1).unwrap();
+    handle.send(2).unwrap();
+    handle.send(3).unwrap();
 
     tick(Duration::from_millis(80)).await;
     assert_eq!(batches.lock().unwrap().len(), 0);
@@ -599,9 +608,9 @@ mod tracing_tests {
         let join = tokio::spawn(accumulator.run());
 
         // 填满队列
-        handle.submit_no_wait(1).unwrap();
-        handle.submit_no_wait(2).unwrap();
-        let result = handle.submit_no_wait(3);
+        handle.send(1).unwrap();
+        handle.send(2).unwrap();
+        let result = handle.send(3);
         assert!(matches!(result, Err(AccumulatorError::QueueFull { .. })));
 
         handle.flush_now();
@@ -652,5 +661,266 @@ mod tracing_tests {
 
         drop(handle);
         let _ = join.await;
+    }
+}
+
+// ─── submit_blocking / send_blocking ───
+
+#[tokio::test]
+async fn test_submit_blocking_waits_for_slot() {
+    let config = AccumulatorConfig::new(
+        Duration::from_millis(200),
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .with_max_queue_depth(1);
+
+    let (handle, accumulator) = config.build(
+        StringProcessor,
+        DefaultMetrics::new(),
+        FixedController::new(Duration::from_millis(200)),
+    );
+
+    let join = tokio::spawn(accumulator.run());
+
+    // 占满队列
+    let _reply = handle.submit(1).unwrap();
+
+    // 阻塞提交：应该等待 slot 释放后成功
+    let h2 = handle.clone();
+    let blocking_result = tokio::spawn(async move {
+        h2.submit_blocking(2, Duration::from_secs(5)).await
+    });
+
+    // 稍等后触发 flush 释放 slot
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    handle.flush_now();
+
+    let result = blocking_result.await.unwrap().unwrap();
+    let reply = result.await.unwrap();
+    assert_eq!(reply, "y-2");
+
+    drop(handle);
+    let _ = join.await;
+}
+
+#[tokio::test]
+async fn test_send_blocking_waits() {
+    let config = AccumulatorConfig::new(
+        Duration::from_millis(200),
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .with_max_queue_depth(1);
+
+    let (handle, accumulator) = config.build(
+        StringProcessor,
+        DefaultMetrics::new(),
+        FixedController::new(Duration::from_millis(200)),
+    );
+
+    let join = tokio::spawn(accumulator.run());
+
+    // 占满队列
+    handle.send(1).unwrap();
+
+    // send_blocking 应等待 slot
+    let h2 = handle.clone();
+    let blocking_task = tokio::spawn(async move {
+        h2.send_blocking(2, Duration::from_secs(5)).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    handle.flush_now();
+
+    assert!(blocking_task.await.unwrap().is_ok());
+
+    drop(handle);
+    let _ = join.await;
+}
+
+// ─── drain_timeout ───
+
+#[tokio::test]
+async fn test_drain_timeout_does_not_hang() {
+    // 使用并发模式 + drain_timeout，确保 drain 不会永久挂起
+    let config = AccumulatorConfig::new(
+        Duration::from_millis(200),
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 1 })
+    .with_drain_timeout(Some(Duration::from_millis(500)));
+
+    let (handle, accumulator) = config.build(
+        SlowProcessor { delay: Duration::from_secs(10) },
+        DefaultMetrics::new(),
+        FixedController::new(Duration::from_millis(200)),
+    );
+
+    let join = tokio::spawn(accumulator.run());
+
+    handle.send(1).unwrap();
+    // 手动 flush 触发并发处理
+    handle.flush_now();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // drop handle 触发 drain，drain_timeout=500ms 应生效
+    drop(handle);
+
+    // 不应永久挂起
+    let result = tokio::time::timeout(Duration::from_secs(2), join).await;
+    assert!(result.is_ok(), "drain with timeout should complete");
+}
+
+// ─── Batch 上下文 ───
+
+struct ContextCheckProcessor {
+    seen: Arc<Mutex<Option<(Duration, usize)>>>,
+}
+
+impl BatchProcessor<i32> for ContextCheckProcessor {
+    async fn process(&self, batch: Batch<i32>) -> Vec<()> {
+        let w = batch.window_duration();
+        let q = batch.queue_depth_at_flush();
+        *self.seen.lock().unwrap() = Some((w, q));
+        vec![(); batch.len()]
+    }
+}
+
+#[tokio::test]
+async fn test_batch_context_fields() {
+    let seen = Arc::new(Mutex::new(None));
+    let config = AccumulatorConfig::new(
+        Duration::from_millis(100),
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+
+    let (handle, accumulator) = config.build(
+        ContextCheckProcessor {
+            seen: Arc::clone(&seen),
+        },
+        DefaultMetrics::new(),
+        FixedController::new(Duration::from_millis(100)),
+    );
+
+    let join = tokio::spawn(accumulator.run());
+
+    handle.send(1).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    drop(handle);
+    let _ = join.await;
+
+    let ctx = seen.lock().unwrap();
+    assert!(ctx.is_some(), "batch context should be set");
+    let (window, _queue_depth) = ctx.unwrap();
+    assert!(window > Duration::ZERO, "window_duration should be non-zero");
+}
+
+// ─── health 检查 ───
+
+#[tokio::test]
+async fn test_health_reflects_state() {
+    let config = AccumulatorConfig::new(
+        Duration::from_millis(200),
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .with_max_queue_depth(10);
+
+    let (handle, accumulator) = config.build(
+        StringProcessor,
+        DefaultMetrics::new(),
+        FixedController::new(Duration::from_millis(200)),
+    );
+
+    let join = tokio::spawn(accumulator.run());
+
+    let health = handle.health();
+    assert!(health.is_accepting);
+    assert!(health.current_window > Duration::ZERO);
+    assert_eq!(health.total_rejected, 0);
+
+    drop(handle);
+    let _ = join.await;
+}
+
+// ─── record_rejected 统计 ───
+
+#[tokio::test]
+async fn test_rejected_counter_increments() {
+    let config = AccumulatorConfig::new(
+        Duration::from_millis(200),
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .with_max_queue_depth(1);
+
+    let (handle, accumulator) = config.build(
+        StringProcessor,
+        DefaultMetrics::new(),
+        FixedController::new(Duration::from_millis(200)),
+    );
+
+    let join = tokio::spawn(accumulator.run());
+
+    // 占满队列
+    let _reply = handle.submit(1).unwrap();
+    // 尝试再次提交，应被拒绝
+    let err = handle.send(2).unwrap_err();
+    assert!(matches!(err, AccumulatorError::QueueFull { .. }));
+
+    let health = handle.health();
+    assert_eq!(health.total_rejected, 1);
+
+    drop(handle);
+    let _ = join.await;
+}
+
+// ─── send (重命名后) fire-and-forget ───
+
+#[tokio::test]
+async fn test_send_fire_and_forget() {
+    let config = AccumulatorConfig::new(
+        Duration::from_millis(200),
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+
+    let (handle, accumulator) = config.build(
+        StringProcessor,
+        DefaultMetrics::new(),
+        FixedController::new(Duration::from_millis(200)),
+    );
+
+    let join = tokio::spawn(accumulator.run());
+
+    // send 不返回 ReplyHandle
+    assert!(handle.send(42).is_ok());
+
+    drop(handle);
+    let _ = join.await;
+}
+
+// ─── 辅助处理器 ───
+
+/// 模拟慢处理的处理器。
+struct SlowProcessor {
+    delay: Duration,
+}
+
+impl BatchProcessor<i32> for SlowProcessor {
+    async fn process(&self, batch: Batch<i32>) -> Vec<()> {
+        tokio::time::sleep(self.delay).await;
+        vec![(); batch.len()]
     }
 }

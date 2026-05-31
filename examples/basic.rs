@@ -68,7 +68,7 @@ async fn main() {
     // 场景2: fire-and-forget + reply 混合
     println!("\n=== 场景2: fire-and-forget + reply 混合 ===");
     for i in 1..=5 {
-        handle.submit_no_wait(format!("fire-{i}")).unwrap();
+        handle.send(format!("fire-{i}")).unwrap();
     }
     let reply2 = handle
         .submit("mixed-reply".into())

@@ -50,6 +50,9 @@ pub struct AccumulatorConfig {
     /// drain 阶段等待 inflight task 完成的超时时间。
     /// `None` 表示无限等待（默认）。仅在并发模式下生效。
     pub(crate) drain_timeout: Option<Duration>,
+    /// 主循环每轮非阻塞 drain 的最大批次数，防止 bypass/feedback 饿死 select!。
+    /// 默认 64。
+    pub(crate) drain_batch_limit: usize,
 }
 
 impl AccumulatorConfig {
@@ -90,6 +93,7 @@ impl AccumulatorConfig {
             tracing_level: crate::trace::default_tracing_level(),
             trace_per_item: false,
             drain_timeout: None,
+            drain_batch_limit: 64,
         })
     }
 
@@ -167,6 +171,15 @@ impl AccumulatorConfig {
         self
     }
 
+    /// 设置主循环每轮非阻塞 drain 的最大批次数。
+    ///
+    /// 防止 bypass/feedback 通道饿死 select!。默认 64。
+    /// 高吞吐场景可适当增大。
+    pub fn with_drain_batch_limit(mut self, limit: usize) -> Self {
+        self.drain_batch_limit = limit;
+        self
+    }
+
     /// 消费配置，构建 [`AccumulatorHandle`] 和 [`BatchAccumulator`]（无权重追踪）。
     ///
     /// 等价于 `build_with_weight(processor, metrics, controller, |_| 1)`。
@@ -209,10 +222,10 @@ impl AccumulatorConfig {
         let (bypass_tx, bypass_rx) = mpsc::unbounded_channel();
         let (feedback_tx, feedback_rx) = mpsc::unbounded_channel::<FlushInfo>();
         let pending_count = Arc::new(AtomicUsize::new(0));
-        let inflight_count = Arc::new(AtomicUsize::new(0));
         let flush_notify = Arc::new(Notify::new());
         let queue_notify = Arc::new(Notify::new());
         let stats = Arc::new(AccumulatorStats::new());
+        let shared = Arc::new(crate::accumulator::SharedState::new(self.initial_window));
 
         let handle = AccumulatorHandle {
             sender: tx,
@@ -223,9 +236,8 @@ impl AccumulatorConfig {
             stats: Arc::clone(&stats),
             tracing_level: self.tracing_level,
             queue_notify: Arc::clone(&queue_notify),
+            shared: Arc::clone(&shared),
         };
-
-        let current_window = self.initial_window;
 
         let accumulator = BatchAccumulator {
             config: self,
@@ -236,18 +248,17 @@ impl AccumulatorConfig {
             bypass_rx,
             flush_notify,
             buffer: std::collections::VecDeque::new(),
-            current_window,
             next_batch_id: 0,
             last_flush_time: tokio::time::Instant::now(),
             pending_count,
             feedback_rx,
             feedback_tx,
             inflight: JoinSet::new(),
-            inflight_count,
             stats,
             weight_fn: Arc::new(weight_fn),
             current_weight: 0,
             queue_notify: Arc::clone(&queue_notify),
+            shared,
         };
 
         (handle, accumulator)
@@ -269,6 +280,7 @@ impl Default for AccumulatorConfig {
             tracing_level: crate::trace::default_tracing_level(),
             trace_per_item: false,
             drain_timeout: None,
+            drain_batch_limit: 64,
         }
     }
 }

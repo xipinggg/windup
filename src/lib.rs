@@ -76,7 +76,10 @@
 //! - `adjustment_rate` 从小开始（0.05），观察收敛曲线后逐步增大。
 //! - `drain_timeout` 设置为单批处理的 p99 延迟 × 3。
 
-// async fn in trait 是有意设计选择，用户无需关心 Send bound。
+// async fn in trait 是有意设计选择：
+// - 零开销：无需 Box<dyn Future> 堆分配，编译器内联生成
+// - 生态一致：draft 面向 tokio 生态，用户已在 stable 2024 edition 上使用
+// - 备选方案 `async_trait` 会增加 proc-macro 依赖和间接调用开销
 #![allow(async_fn_in_trait)]
 
 pub mod accumulator;
@@ -98,7 +101,7 @@ pub mod prelude {
     };
     pub use crate::error::AccumulatorError;
     pub use crate::metrics::{
-        DefaultMetrics, MetricsCollector, MetricsSnapshot, BYPASS_DRAIN_LIMIT, DEFAULT_EMA_ALPHA,
+        DefaultMetrics, MetricsCollector, MetricsSnapshot, DEFAULT_EMA_ALPHA,
     };
     pub use crate::stats::{AccumulatorHealth, StatsSnapshot};
 }
