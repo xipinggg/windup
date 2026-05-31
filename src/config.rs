@@ -43,6 +43,10 @@ pub struct AccumulatorConfig {
     pub(crate) concurrency_mode: ConcurrencyMode,
     pub(crate) stats_enabled: bool,
     pub(crate) max_batch_weight: Option<usize>,
+    /// tracing 日志级别。None 表示运行时关闭。feature 关闭时类型为 ()。
+    pub(crate) tracing_level: crate::trace::TraceLevel,
+    /// 是否记录 per-item TRACE 级别事件（高频，默认关闭）。
+    pub(crate) trace_per_item: bool,
 }
 
 impl AccumulatorConfig {
@@ -80,6 +84,8 @@ impl AccumulatorConfig {
             concurrency_mode: ConcurrencyMode::Serial,
             stats_enabled: false,
             max_batch_weight: None,
+            tracing_level: crate::trace::default_tracing_level(),
+            trace_per_item: false,
         })
     }
 
@@ -121,6 +127,30 @@ impl AccumulatorConfig {
     /// 需要配合 [`build_with_weight`](Self::build_with_weight) 传入权重函数。
     pub fn with_max_batch_weight(mut self, n: usize) -> Self {
         self.max_batch_weight = Some(n);
+        self
+    }
+
+    /// 设置 tracing 日志级别。设为 `None` 可在运行时完全关闭 tracing。
+    ///
+    /// 仅在 `tracing` feature 开启时生效。
+    #[cfg(feature = "tracing")]
+    pub fn with_tracing_level(mut self, level: Option<tracing::Level>) -> Self {
+        self.tracing_level = level;
+        self
+    }
+
+    /// feature 关闭时的桩方法，接收并忽略参数，保持 API 一致性。
+    #[cfg(not(feature = "tracing"))]
+    pub fn with_tracing_level(mut self, level: ()) -> Self {
+        self.tracing_level = level;
+        self
+    }
+
+    /// 是否开启 per-item 级别追踪（`TRACE` 级别事件）。
+    ///
+    /// 高频路径，默认关闭。仅在 `tracing` feature 开启时生效。
+    pub fn with_trace_per_item(mut self, enabled: bool) -> Self {
+        self.trace_per_item = enabled;
         self
     }
 
@@ -178,6 +208,7 @@ impl AccumulatorConfig {
             max_queue_depth: self.max_queue_depth,
             flush_notify: Arc::clone(&flush_notify),
             stats: Arc::clone(&stats),
+            tracing_level: self.tracing_level,
         };
 
         let current_window = self.initial_window;
@@ -220,6 +251,8 @@ impl Default for AccumulatorConfig {
             concurrency_mode: ConcurrencyMode::Serial,
             stats_enabled: false,
             max_batch_weight: None,
+            tracing_level: crate::trace::default_tracing_level(),
+            trace_per_item: false,
         }
     }
 }

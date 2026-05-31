@@ -72,6 +72,7 @@ pub struct AccumulatorHandle<T, R> {
     pub(crate) max_queue_depth: Option<usize>,
     pub(crate) flush_notify: Arc<Notify>,
     pub(crate) stats: Arc<AccumulatorStats>,
+    pub(crate) tracing_level: crate::trace::TraceLevel,
 }
 
 impl<T: Send, R: Send> Clone for AccumulatorHandle<T, R> {
@@ -83,6 +84,7 @@ impl<T: Send, R: Send> Clone for AccumulatorHandle<T, R> {
             max_queue_depth: self.max_queue_depth,
             flush_notify: Arc::clone(&self.flush_notify),
             stats: Arc::clone(&self.stats),
+            tracing_level: self.tracing_level,
         }
     }
 }
