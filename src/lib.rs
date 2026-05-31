@@ -53,6 +53,7 @@ pub mod controller;
 pub mod error;
 pub mod metrics;
 pub mod stats;
+pub mod trace;
 
 /// 常用类型和 trait 的批量导入。
 pub mod prelude {
