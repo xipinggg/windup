@@ -6,9 +6,6 @@ use crate::error::AccumulatorError;
 /// EMA 平滑系数的默认值。
 pub const DEFAULT_EMA_ALPHA: f64 = 0.3;
 
-/// bypass drain 循环每轮最大处理数，防止饿死主 select!。
-pub const BYPASS_DRAIN_LIMIT: usize = 64;
-
 /// 指标快照，供 [`WindowController`](super::controller::WindowController) 查询。
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {

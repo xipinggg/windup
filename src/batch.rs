@@ -36,17 +36,6 @@ pub struct Batch<T> {
 }
 
 impl<T> Batch<T> {
-    /// 创建新批次。
-    pub fn new(items: Vec<T>, batch_id: u64) -> Self {
-        Self {
-            items,
-            batch_id,
-            created_at: Instant::now(),
-            window_duration: Duration::ZERO,
-            queue_depth_at_flush: 0,
-        }
-    }
-
     /// 创建带上下文信息的新批次。
     pub(crate) fn with_context(
         items: Vec<T>,

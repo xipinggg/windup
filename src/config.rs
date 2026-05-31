@@ -41,7 +41,6 @@ pub struct AccumulatorConfig {
     pub(crate) max_queue_depth: Option<usize>,
     pub(crate) flush_empty_batches: bool,
     pub(crate) concurrency_mode: ConcurrencyMode,
-    pub(crate) stats_enabled: bool,
     pub(crate) max_batch_weight: Option<usize>,
     /// tracing 日志级别。None 表示运行时关闭。feature 关闭时类型为 ()。
     pub(crate) tracing_level: crate::trace::TraceLevel,
@@ -88,7 +87,6 @@ impl AccumulatorConfig {
             max_queue_depth: None,
             flush_empty_batches: false,
             concurrency_mode: ConcurrencyMode::Serial,
-            stats_enabled: false,
             max_batch_weight: None,
             tracing_level: crate::trace::default_tracing_level(),
             trace_per_item: false,
@@ -119,14 +117,6 @@ impl AccumulatorConfig {
     /// 设置并发模式。默认为 [`ConcurrencyMode::Serial`]。
     pub fn with_concurrency_mode(mut self, mode: ConcurrencyMode) -> Self {
         self.concurrency_mode = mode;
-        self
-    }
-
-    /// 开启或关闭可观测性统计。默认关闭。
-    ///
-    /// 开启后可通过 [`AccumulatorHandle::stats`] 获取运行统计快照。
-    pub fn with_stats(mut self, enabled: bool) -> Self {
-        self.stats_enabled = enabled;
         self
     }
 
@@ -275,7 +265,6 @@ impl Default for AccumulatorConfig {
             max_queue_depth: None,
             flush_empty_batches: false,
             concurrency_mode: ConcurrencyMode::Serial,
-            stats_enabled: false,
             max_batch_weight: None,
             tracing_level: crate::trace::default_tracing_level(),
             trace_per_item: false,

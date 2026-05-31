@@ -6,23 +6,7 @@
 use std::time::Duration;
 
 // ── 常量（feature 无关）──
-// 这些常量在 span 创建函数中内联使用，保留定义供文档和审计引用。
-
-#[allow(dead_code)]
-/// Span 名称：累加器主循环。
-pub(crate) const SPAN_RUN: &str = "run";
-#[allow(dead_code)]
-/// Span 名称：批次处理。
-pub(crate) const SPAN_BATCH: &str = "batch";
-#[allow(dead_code)]
-/// Span 名称：单个 item 处理。
-pub(crate) const SPAN_ITEM: &str = "item";
-#[allow(dead_code)]
-/// Span 名称：bypass 直接交付。
-pub(crate) const SPAN_BYPASS: &str = "bypass";
-#[allow(dead_code)]
-/// Span 名称：shutdown 清空。
-pub(crate) const SPAN_DRAIN: &str = "drain";
+// Span 名称在各 span 创建函数中内联使用字符串字面量。
 
 // ── tracing 开启的实现 ──
 

@@ -101,7 +101,7 @@ pub mod prelude {
     };
     pub use crate::error::AccumulatorError;
     pub use crate::metrics::{
-        DefaultMetrics, MetricsCollector, MetricsSnapshot, DEFAULT_EMA_ALPHA,
+        DefaultMetrics, MetricsCollector, MetricsSnapshot,
     };
     pub use crate::stats::{AccumulatorHealth, StatsSnapshot};
 }
