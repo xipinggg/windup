@@ -50,6 +50,9 @@ pub(crate) struct ChannelItem<T, R> {
     pub reply: Option<tokio::sync::oneshot::Sender<Result<R, AccumulatorError>>>,
     /// 优先级。
     pub priority: Priority,
+    /// 调用方 submit 时的 span，用于跨 channel 传播上下文。
+    /// feature 关闭时为零大小类型，编译器优化掉。
+    pub parent_span: crate::trace::MaybeSpan,
 }
 
 /// 缓冲区中暂存的 item。
@@ -60,6 +63,8 @@ pub(crate) struct BufferItem<T, R> {
     deadline: Option<Instant>,
     /// 回复通道。`None` 表示 fire-and-forget。
     reply: Option<tokio::sync::oneshot::Sender<Result<R, AccumulatorError>>>,
+    /// 提交方 span，传到 flush 侧建立 follows_from 关联。
+    parent_span: crate::trace::MaybeSpan,
 }
 
 /// 向累加器提交 item 的句柄。
@@ -125,6 +130,7 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
                 deadline: None,
                 reply: None,
                 priority: Priority::Normal,
+                parent_span: crate::trace::current_span(),
             })
             .map_err(|_| {
                 self.pending_count.fetch_sub(1, Ordering::Release);
@@ -172,6 +178,7 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
                 deadline: None,
                 reply: Some(tx),
                 priority: Priority::Normal,
+                parent_span: crate::trace::current_span(),
             })
             .map_err(|_| {
                 self.pending_count.fetch_sub(1, Ordering::Release);
@@ -268,6 +275,7 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
                 deadline,
                 reply: Some(tx),
                 priority: opts.priority,
+                parent_span: crate::trace::current_span(),
             })
             .map_err(|_| {
                 self.pending_count.fetch_sub(1, Ordering::Release);
@@ -418,6 +426,7 @@ where
                                 value: ch.value,
                                 deadline: ch.deadline,
                                 reply: ch.reply,
+                                parent_span: ch.parent_span,
                             };
 
                             self.current_weight = self
@@ -732,6 +741,7 @@ where
                 value: ch.value,
                 deadline: ch.deadline,
                 reply: ch.reply,
+                parent_span: ch.parent_span,
             });
         }
 
