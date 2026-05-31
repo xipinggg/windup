@@ -8,7 +8,7 @@
 //!
 //! ```rust,ignore
 //! use std::time::Duration;
-//! use draft::prelude::*;
+//! use windup::prelude::*;
 //!
 //! struct MyProcessor;
 //! impl BatchProcessor<i32> for MyProcessor {
@@ -81,7 +81,7 @@
 
 // async fn in trait 是有意设计选择：
 // - 零开销：无需 Box<dyn Future> 堆分配，编译器内联生成
-// - 生态一致：draft 面向 tokio 生态，用户已在 stable 2024 edition 上使用
+// - 生态一致：windup 面向 tokio 生态，用户已在 stable 2024 edition 上使用
 // - 备选方案 `async_trait` 会增加 proc-macro 依赖和间接调用开销
 #![allow(async_fn_in_trait)]
 

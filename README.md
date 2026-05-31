@@ -1,8 +1,8 @@
-# draft — 自适应时间窗口批处理累加器
+# windup — 自适应时间窗口批处理累加器
 
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![docs.rs](https://img.shields.io/docsrs/draft)](https://docs.rs/draft)
+[![docs.rs](https://img.shields.io/docsrs/windup)](https://docs.rs/windup)
 
 通用的异步批处理框架。在可配置的时间窗口内积攒 item，到期后整批交付用户定义的处理器。时间窗口基于批利用率或执行延迟**自适应调整**。
 
@@ -10,7 +10,7 @@
 
 ```rust
 use std::time::Duration;
-use draft::prelude::*;
+use windup::prelude::*;
 
 struct MyProcessor;
 impl BatchProcessor<i32> for MyProcessor {
@@ -77,7 +77,7 @@ let reply = handle.submit(item)?;                // 获取结果
 let result: R = reply.await?;
 
 // 带选项
-use draft::prelude::*;
+use windup::prelude::*;
 let reply = handle.submit_with(item, SubmitOptions {
     priority: Priority::High,
     ttl: Some(Duration::from_secs(30)),
@@ -178,7 +178,7 @@ health.total_rejected             // 累计拒绝次数
 
 ```toml
 [dependencies]
-draft = "0.1"
+windup = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 

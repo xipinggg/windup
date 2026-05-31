@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use draft::prelude::*;
+use windup::prelude::*;
 
 /// 测试用处理器：将 i32 转为 String。
 struct StringProcessor;
@@ -530,7 +530,7 @@ async fn test_serial_unchanged() {
 #[cfg(feature = "tracing")]
 mod tracing_tests {
     use std::time::Duration;
-    use draft::prelude::*;
+    use windup::prelude::*;
     use tracing_subscriber::util::SubscriberInitExt;
 
     /// 验证 tracing flush 事件正常发出（不 panic）

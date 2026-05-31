@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use draft::prelude::*;
+use windup::prelude::*;
 
 /// 轻量级处理器用于基准测试。
 struct NoopProcessor;

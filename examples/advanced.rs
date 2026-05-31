@@ -5,7 +5,7 @@
 //! ```
 
 use std::time::Duration;
-use draft::prelude::*;
+use windup::prelude::*;
 
 struct LoggingProcessor;
 

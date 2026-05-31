@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use draft::prelude::*;
+use windup::prelude::*;
 
 /// 带结果返回的批处理器：将接收到的字符串大写后返回。
 struct UpperProcessor {
