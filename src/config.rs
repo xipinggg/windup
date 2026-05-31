@@ -102,7 +102,7 @@ impl AccumulatorConfig {
     }
 
     /// 设置最大队列深度。超限时 [`AccumulatorHandle::submit`] 返回
-    /// [`AccumulatorError::QueueFull`](crate::error::AccumulatorError::QueueFull)。
+    /// [`AccumulatorError::QueueFull`]。
     pub fn with_max_queue_depth(mut self, n: usize) -> Self {
         self.max_queue_depth = Some(n);
         self
@@ -130,16 +130,9 @@ impl AccumulatorConfig {
 
     /// 设置 tracing 日志级别。设为 `None` 可在运行时完全关闭 tracing。
     ///
-    /// 仅在 `tracing` feature 开启时生效。
+    /// 仅在 `tracing` feature 开启时可用。
     #[cfg(feature = "tracing")]
     pub fn with_tracing_level(mut self, level: Option<tracing::Level>) -> Self {
-        self.tracing_level = level;
-        self
-    }
-
-    /// feature 关闭时的桩方法，接收并忽略参数，保持 API 一致性。
-    #[cfg(not(feature = "tracing"))]
-    pub fn with_tracing_level(mut self, level: ()) -> Self {
         self.tracing_level = level;
         self
     }

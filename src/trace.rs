@@ -90,7 +90,10 @@ mod imp {
     pub(crate) type TraceLevel = ();
     /// 零大小 span 类型，提供与 tracing Span 兼容的方法签名。
     /// feature 关闭时所有方法均为空操作。
-    #[derive(Clone, Copy)]
+    ///
+    /// 注意：不实现 Copy，因为 feature 开启时 tracing::Span 也不实现 Copy，
+    /// 这样两套配置下 `.clone()` 的行为保持一致，避免 clippy::clone_on_copy 警告。
+    #[derive(Clone)]
     pub(crate) struct MaybeSpan;
 
     impl MaybeSpan {
@@ -106,12 +109,14 @@ mod imp {
 
         /// 将 future 包装到 span 中（空操作，直接返回 future）。
         #[inline]
+        #[allow(dead_code)]
         pub(crate) fn instrument<F: std::future::Future>(self, f: F) -> F {
             f
         }
     }
 
     /// 占位类型，仅在 config 默认值构造时使用。
+    #[allow(dead_code)]
     pub(crate) type Level = ();
 
     #[inline]
@@ -145,9 +150,8 @@ mod imp {
     }
 
     #[inline]
-    pub(crate) fn default_tracing_level() -> TraceLevel {
-        ()
-    }
+    #[allow(clippy::unused_unit)]
+    pub(crate) fn default_tracing_level() -> TraceLevel {}
 }
 
 #[cfg(not(feature = "tracing"))]

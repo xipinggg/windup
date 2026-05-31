@@ -242,8 +242,7 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
 
     /// 获取运行统计快照。
     ///
-    /// 需要在 [`AccumulatorConfig::with_stats(true)`] 开启统计。
-    /// 若未开启，各计数器均为 0。
+    /// 统计始终开启，无需额外配置。计数器初始为 0。
     pub fn stats(&self) -> StatsSnapshot {
         let current_window = *self.shared.current_window.read().unwrap_or_else(|e| e.into_inner());
         self.stats.snapshot(
@@ -599,6 +598,7 @@ where
     }
 
     /// 通过 spawn 隔离 processor panic。panic 时记录错误并返回空 Vec。
+    #[allow(unused_variables)]
     async fn process_safe(tracing_level: crate::trace::TraceLevel, processor: Arc<P>, batch: Batch<T>) -> Vec<R> {
         let handle = tokio::spawn(async move { processor.process(batch).await });
         match handle.await {
@@ -665,6 +665,7 @@ where
     }
 
     /// 并发模式：在后台 task 中处理 bypass 批次。
+    #[allow(clippy::let_unit_value)]
     fn spawn_bypass(&mut self, items: Vec<T>) {
         let batch_id = self.next_batch_id;
         self.next_batch_id += 1;
@@ -709,6 +710,7 @@ where
     }
 
     /// 并发模式：在后台 task 中处理批次。
+    #[allow(clippy::let_unit_value)]
     fn spawn_flush(&mut self, time_since_last_flush: Duration) {
         let (items, senders, parent_spans, batch_id, batch_span, total_weight) = self.drain_buffer_items();
         let batch_size = items.len();
@@ -849,6 +851,7 @@ where
     }
 
     /// flush 内核心逻辑（串行模式）：处理 buffer → FlushInfo → 记录指标。
+    #[allow(clippy::unit_arg)]
     async fn flush_inner(&mut self, time_since_last_flush: Duration) {
         let (items, senders, parent_spans, batch_id, batch_span, total_weight) = self.drain_buffer_items();
         let batch_size = items.len();
@@ -1089,6 +1092,7 @@ where
     }
 
     /// 记录 inflight task 的异常退出（panic 或取消）。
+    #[allow(unused_variables)]
     fn log_inflight_error(
         result: Result<(), tokio::task::JoinError>,
         tracing_level: &crate::trace::TraceLevel,

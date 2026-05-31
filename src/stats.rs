@@ -1,7 +1,7 @@
 //! 可观测性统计模块。
 //!
-//! 统计始终开启，可通过 [`AccumulatorHandle::stats`]
-//! 和 [`AccumulatorHandle::health`] 获取运行快照和健康状态。
+//! 统计始终开启，可通过 [`AccumulatorHandle::stats`](crate::accumulator::AccumulatorHandle::stats)
+//! 和 [`AccumulatorHandle::health`](crate::accumulator::AccumulatorHandle::health) 获取运行快照和健康状态。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;

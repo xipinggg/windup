@@ -40,12 +40,12 @@
 //! - **时间窗口**：item 在缓冲区内积攒的时间。到期后整批交付处理器。
 //!   - 最小窗口 (`min_window`) 和最大窗口 (`max_window`) 限制自适应范围。
 //! - **自适应控制**：每次 flush 后根据指标调整窗口大小。
-//!   - [`AdaptiveController`]：批利用率低 → 窗口增大，利用率高 → 窗口缩小。
-//!   - [`LatencyAdaptiveController`]：执行变慢 → 窗口缩小，执行变快 → 窗口增大。
-//!   - [`FixedController`]：固定窗口，不做自适应。
+//!   - [`AdaptiveController`](crate::controller::AdaptiveController)：批利用率低 → 窗口增大，利用率高 → 窗口缩小。
+//!   - [`LatencyAdaptiveController`](crate::controller::LatencyAdaptiveController)：执行变慢 → 窗口缩小，执行变快 → 窗口增大。
+//!   - [`FixedController`](crate::controller::FixedController)：固定窗口，不做自适应。
 //! - **并发模式**：
-//!   - [`ConcurrencyMode::Serial`]（默认）：批次在主循环中同步处理。
-//!   - [`ConcurrencyMode::Concurrent`]：批次在后台 tokio task 中处理，主循环可继续收集 item。
+//!   - [`ConcurrencyMode::Serial`](crate::config::ConcurrencyMode::Serial)（默认）：批次在主循环中同步处理。
+//!   - [`ConcurrencyMode::Concurrent`](crate::config::ConcurrencyMode::Concurrent)：批次在后台 tokio task 中处理，主循环可继续收集 item。
 //!
 //! # 特性
 //!
