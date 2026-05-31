@@ -35,13 +35,46 @@
 //! let result = reply.await?;  // 拿到处理结果
 //! ```
 //!
-//! # 自适应行为
+//! # 核心概念
 //!
-//! 内置两种控制器：
-//! - [`AdaptiveController`]：基于批利用率调整窗口
-//! - [`LatencyAdaptiveController`]：基于执行时间 vs EMA 基准调整窗口
+//! - **时间窗口**：item 在缓冲区内积攒的时间。到期后整批交付处理器。
+//!   - 最小窗口 (`min_window`) 和最大窗口 (`max_window`) 限制自适应范围。
+//! - **自适应控制**：每次 flush 后根据指标调整窗口大小。
+//!   - [`AdaptiveController`]：批利用率低 → 窗口增大，利用率高 → 窗口缩小。
+//!   - [`LatencyAdaptiveController`]：执行变慢 → 窗口缩小，执行变快 → 窗口增大。
+//!   - [`FixedController`]：固定窗口，不做自适应。
+//! - **并发模式**：
+//!   - [`ConcurrencyMode::Serial`]（默认）：批次在主循环中同步处理。
+//!   - [`ConcurrencyMode::Concurrent`]：批次在后台 tokio task 中处理，主循环可继续收集 item。
 //!
-//! 用户可实现 [`MetricsCollector`] + [`WindowController`] 自定义策略。
+//! # 特性
+//!
+//! | 特性 | 说明 |
+//! |------|------|
+//! | 自适应窗口 | 基于利用率或延迟自动调整 |
+//! | 串行/并发 | 两种处理模式 |
+//! | 优先级 | Normal / High 两级，高优先级插队 |
+//! | 超时控制 | item 级别 TTL + drain 超时 |
+//! | 权重追踪 | 按 item "重量" 触发提前 flush |
+//! | 阻塞提交 | 队列满时等待空位（`submit_blocking`） |
+//! | bypass | 跳过批处理，直接交付 |
+//! | 可观测性 | tracing span/event + stats 快照 + health 检查 |
+//! | 零开销抽象 | tracing feature 可关闭，编译器优化掉所有桩代码 |
+//!
+//! # 选择处理器
+//!
+//! | 处理器类型 | 适用场景 |
+//! |-----------|---------|
+//! | `NoopProcessor`（自定义） | 基准测试 / 丢弃数据 |
+//! | 批量写数据库 | `max_batch_size=500`，窗口 1s |
+//! | 批量发 HTTP | `Concurrent { max_inflight: 8 }` |
+//! | 低延迟 bypass | 紧急事件用 `handle.bypass(item)` |
+//!
+//! # 调参建议
+//!
+//! - 初始窗口 = `max_batch_size / 预期QPS`。例如 QPS=500, max_batch_size=100 → 初始窗口 ≈ 200ms。
+//! - `adjustment_rate` 从小开始（0.05），观察收敛曲线后逐步增大。
+//! - `drain_timeout` 设置为单批处理的 p99 延迟 × 3。
 
 // async fn in trait 是有意设计选择，用户无需关心 Send bound。
 #![allow(async_fn_in_trait)]
@@ -67,5 +100,5 @@ pub mod prelude {
     pub use crate::metrics::{
         DefaultMetrics, MetricsCollector, MetricsSnapshot, BYPASS_DRAIN_LIMIT, DEFAULT_EMA_ALPHA,
     };
-    pub use crate::stats::StatsSnapshot;
+    pub use crate::stats::{AccumulatorHealth, StatsSnapshot};
 }

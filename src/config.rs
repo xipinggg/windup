@@ -47,6 +47,9 @@ pub struct AccumulatorConfig {
     pub(crate) tracing_level: crate::trace::TraceLevel,
     /// 是否记录 per-item TRACE 级别事件（高频，默认关闭）。
     pub(crate) trace_per_item: bool,
+    /// drain 阶段等待 inflight task 完成的超时时间。
+    /// `None` 表示无限等待（默认）。仅在并发模式下生效。
+    pub(crate) drain_timeout: Option<Duration>,
 }
 
 impl AccumulatorConfig {
@@ -86,6 +89,7 @@ impl AccumulatorConfig {
             max_batch_weight: None,
             tracing_level: crate::trace::default_tracing_level(),
             trace_per_item: false,
+            drain_timeout: None,
         })
     }
 
@@ -154,6 +158,15 @@ impl AccumulatorConfig {
         self
     }
 
+    /// 设置 drain 阶段等待 inflight task 完成的超时时间。
+    ///
+    /// `None` 表示无限等待（默认）。仅在并发模式下生效。
+    /// 超时后未完成的 inflight task 会被 abort。
+    pub fn with_drain_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.drain_timeout = timeout;
+        self
+    }
+
     /// 消费配置，构建 [`AccumulatorHandle`] 和 [`BatchAccumulator`]（无权重追踪）。
     ///
     /// 等价于 `build_with_weight(processor, metrics, controller, |_| 1)`。
@@ -178,7 +191,6 @@ impl AccumulatorConfig {
     ///
     /// item 类型 `T` 和结果类型 `R` 从 `processor: P` 自动推断。
     #[allow(clippy::type_complexity)]
-    #[allow(clippy::type_complexity)]
     pub fn build_with_weight<T, R, P, M, C>(
         self,
         processor: P,
@@ -199,6 +211,7 @@ impl AccumulatorConfig {
         let pending_count = Arc::new(AtomicUsize::new(0));
         let inflight_count = Arc::new(AtomicUsize::new(0));
         let flush_notify = Arc::new(Notify::new());
+        let queue_notify = Arc::new(Notify::new());
         let stats = Arc::new(AccumulatorStats::new());
 
         let handle = AccumulatorHandle {
@@ -209,6 +222,7 @@ impl AccumulatorConfig {
             flush_notify: Arc::clone(&flush_notify),
             stats: Arc::clone(&stats),
             tracing_level: self.tracing_level,
+            queue_notify: Arc::clone(&queue_notify),
         };
 
         let current_window = self.initial_window;
@@ -233,6 +247,7 @@ impl AccumulatorConfig {
             stats,
             weight_fn: Arc::new(weight_fn),
             current_weight: 0,
+            queue_notify: Arc::clone(&queue_notify),
         };
 
         (handle, accumulator)
@@ -253,6 +268,7 @@ impl Default for AccumulatorConfig {
             max_batch_weight: None,
             tracing_level: crate::trace::default_tracing_level(),
             trace_per_item: false,
+            drain_timeout: None,
         }
     }
 }

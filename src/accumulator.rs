@@ -81,6 +81,8 @@ pub struct AccumulatorHandle<T, R> {
     pub(crate) flush_notify: Arc<Notify>,
     pub(crate) stats: Arc<AccumulatorStats>,
     pub(crate) tracing_level: crate::trace::TraceLevel,
+    /// 队列空位通知：item 被消费后唤醒阻塞的 submit 等待者。
+    pub(crate) queue_notify: Arc<Notify>,
 }
 
 impl<T: Send, R: Send> Clone for AccumulatorHandle<T, R> {
@@ -93,6 +95,7 @@ impl<T: Send, R: Send> Clone for AccumulatorHandle<T, R> {
             flush_notify: Arc::clone(&self.flush_notify),
             stats: Arc::clone(&self.stats),
             tracing_level: self.tracing_level,
+            queue_notify: Arc::clone(&self.queue_notify),
         }
     }
 }
@@ -121,6 +124,7 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
         );
 
         if let Err(prev) = result {
+            self.stats.record_rejected();
             event_at!(
                 Level::WARN,
                 &self.tracing_level,
@@ -174,6 +178,7 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
         );
 
         if let Err(prev) = result {
+            self.stats.record_rejected();
             event_at!(
                 Level::WARN,
                 &self.tracing_level,
@@ -231,7 +236,26 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
             0, // buffer_size 由 Accumulator 侧提供才有准确值
             0, // inflight_count
             0, // current_weight
+            Duration::ZERO, // current_window 由 Accumulator 侧提供
         )
+    }
+
+    /// 获取累加器健康状态。
+    ///
+    /// 供外部监控系统（如 k8s liveness probe）调用。
+    pub fn health(&self) -> crate::stats::AccumulatorHealth {
+        let pending = self.pending_count();
+        let queue_utilization = match self.max_queue_depth {
+            Some(max) if max > 0 => pending as f64 / max as f64,
+            _ => 0.0,
+        };
+        crate::stats::AccumulatorHealth {
+            is_accepting: !self.sender.is_closed(),
+            queue_utilization,
+            current_window: Duration::ZERO, // 由 Accumulator 侧提供准确值
+            inflight_count: 0,               // 由 Accumulator 侧提供准确值
+            total_rejected: self.stats.total_rejected.load(Ordering::Acquire),
+        }
     }
 
     /// 绕过批处理，直接交付处理器。
@@ -277,6 +301,7 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
         );
 
         if let Err(prev) = result {
+            self.stats.record_rejected();
             event_at!(
                 Level::WARN,
                 &self.tracing_level,
@@ -337,6 +362,148 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
             },
         )
     }
+
+    /// 阻塞提交：队列满时等待空位，超时则返回错误。
+    ///
+    /// 与 [`submit`](Self::submit) 不同，此方法不会立即返回
+    /// [`QueueFull`](AccumulatorError::QueueFull)，而是等待直至
+    /// 有空位或超时。
+    ///
+    /// # Errors
+    ///
+    /// - [`AccumulatorError::Timeout`]：等待超时。
+    /// - [`AccumulatorError::Shutdown`]：累加器已关闭。
+    pub async fn submit_blocking(
+        &self,
+        item: T,
+        timeout: Duration,
+    ) -> Result<ReplyHandle<R>, AccumulatorError> {
+        loop {
+            // CAS 预留槽位
+            let cas_result = self.pending_count.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |pending| {
+                    if let Some(max) = self.max_queue_depth
+                        && pending >= max
+                    {
+                        return None;
+                    }
+                    Some(pending + 1)
+                },
+            );
+
+            match cas_result {
+                Ok(_) => {
+                    // 槽位预留成功，发送 item
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    match self.sender.send(ChannelItem {
+                        value: item,
+                        deadline: None,
+                        reply: Some(tx),
+                        priority: Priority::Normal,
+                        parent_span: crate::trace::current_span(),
+                    }) {
+                        Ok(()) => {
+                            self.stats.record_submit();
+                            return Ok(ReplyHandle::new(rx));
+                        }
+                        Err(_) => {
+                            self.pending_count.fetch_sub(1, Ordering::Release);
+                            return Err(AccumulatorError::Shutdown);
+                        }
+                    }
+                }
+                Err(prev) => {
+                    let max = self.max_queue_depth.unwrap_or(0);
+                    event_at!(
+                        Level::WARN,
+                        &self.tracing_level,
+                        max,
+                        pending = prev,
+                        "队列已满，等待空位"
+                    );
+                    // item 未被消费，继续等待
+                    let notified = tokio::select! {
+                        _ = self.queue_notify.notified() => true,
+                        _ = tokio::time::sleep(timeout) => false,
+                    };
+                    if !notified {
+                        return Err(AccumulatorError::Timeout);
+                    }
+                    // item 未被消费，继续循环重试
+                }
+            }
+        }
+    }
+
+    /// 阻塞提交（fire-and-forget 版本）：队列满时等待空位。
+    ///
+    /// 用法同 [`submit_blocking`](Self::submit_blocking)，但不返回处理结果。
+    ///
+    /// # Errors
+    ///
+    /// - [`AccumulatorError::Timeout`]：等待超时。
+    /// - [`AccumulatorError::Shutdown`]：累加器已关闭。
+    pub async fn submit_no_wait_blocking(
+        &self,
+        item: T,
+        timeout: Duration,
+    ) -> Result<(), AccumulatorError> {
+        loop {
+            let cas_result = self.pending_count.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |pending| {
+                    if let Some(max) = self.max_queue_depth
+                        && pending >= max
+                    {
+                        return None;
+                    }
+                    Some(pending + 1)
+                },
+            );
+
+            match cas_result {
+                Ok(_) => {
+                    match self.sender.send(ChannelItem {
+                        value: item,
+                        deadline: None,
+                        reply: None,
+                        priority: Priority::Normal,
+                        parent_span: crate::trace::current_span(),
+                    }) {
+                        Ok(()) => {
+                            self.stats.record_submit();
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            self.pending_count.fetch_sub(1, Ordering::Release);
+                            return Err(AccumulatorError::Shutdown);
+                        }
+                    }
+                }
+                Err(prev) => {
+                    let max = self.max_queue_depth.unwrap_or(0);
+                    event_at!(
+                        Level::WARN,
+                        &self.tracing_level,
+                        max,
+                        pending = prev,
+                        "队列已满，等待空位"
+                    );
+                    let notified = tokio::select! {
+                        _ = self.queue_notify.notified() => true,
+                        _ = tokio::time::sleep(timeout) => false,
+                    };
+                    if !notified {
+                        return Err(AccumulatorError::Timeout);
+                    }
+                    // item 未被消费，继续循环重试
+                }
+            }
+        }
+    }
 }
 
 /// 批累加器核心。
@@ -360,6 +527,8 @@ pub struct BatchAccumulator<T, R, P, M, C> {
     pub(crate) stats: Arc<AccumulatorStats>,
     pub(crate) weight_fn: Arc<dyn Fn(&T) -> usize + Send + Sync>,
     pub(crate) current_weight: usize,
+    /// 队列空位通知：item 被消费后唤醒阻塞的 submit 等待者。
+    pub(crate) queue_notify: Arc<Notify>,
 }
 
 impl<T, R, P, M, C> BatchAccumulator<T, R, P, M, C>
@@ -455,6 +624,8 @@ where
                     match maybe_item {
                         Some(ch) => {
                             self.pending_count.fetch_sub(1, Ordering::Release);
+                            // 唤醒一个阻塞的 submit 等待者
+                            self.queue_notify.notify_one();
 
                             // 检查刚提交的 item 是否已过期
                             if let Some(dl) = ch.deadline
@@ -539,7 +710,7 @@ where
 
         match self.config.concurrency_mode {
             ConcurrencyMode::Serial => {
-                let batch = Batch::new(items, batch_id);
+                let batch = Batch::with_context(items, batch_id, Duration::ZERO, 0);
                 self.processor.process(batch).await;
                 event_at!(
                     Level::DEBUG,
@@ -554,7 +725,7 @@ where
                 if max_inflight > 0
                     && self.inflight_count.load(Ordering::Acquire) >= max_inflight
                 {
-                    let batch = Batch::new(items, batch_id);
+                    let batch = Batch::with_context(items, batch_id, Duration::ZERO, 0);
                     self.processor.process(batch).await;
                 } else {
                     self.spawn_bypass(items);
@@ -571,7 +742,7 @@ where
         let _tracing_level = self.config.tracing_level;
         let bypass_span = crate::trace::bypass_span(batch_id, item_count);
 
-        let batch = Batch::new(items, batch_id);
+        let batch = Batch::with_context(items, batch_id, Duration::ZERO, 0);
         let processor = Arc::clone(&self.processor);
         // InflightGuard: 构造时 +1，drop 时 -1（含 panic）
         let guard = InflightGuard::new(Arc::clone(&self.inflight_count));
@@ -639,7 +810,12 @@ where
         let _tracing_level = self.config.tracing_level;
         let trace_per_item = self.config.trace_per_item;
 
-        let batch = Batch::new(items, batch_id);
+        let batch = Batch::with_context(
+            items,
+            batch_id,
+            self.current_window,
+            queue_depth,
+        );
         let processor = Arc::clone(&self.processor);
         let feedback_tx = self.feedback_tx.clone();
         let pending_count = Arc::clone(&self.pending_count);
@@ -650,7 +826,6 @@ where
 
         self.inflight.spawn(async move {
             let start = Instant::now();
-            let execution_time;
             let items_remaining;
 
             // Enter span for start event — NOT held across await
@@ -666,7 +841,7 @@ where
             }
 
             let results = processor.process(batch).await;
-            execution_time = start.elapsed();
+            let execution_time = start.elapsed();
 
             // Re-enter span for per-item processing and completion event
             {
@@ -825,7 +1000,7 @@ where
         let (items, senders): (Vec<T>, Vec<ReplySender<R>>) =
             buffer_items.into_iter().map(|bi| (bi.value, bi.reply)).unzip();
 
-        let batch = Batch::new(items, batch_id);
+        let batch = Batch::with_context(items, batch_id, self.current_window, queue_depth);
         let proc_start = Instant::now();
         let results = self.processor.process(batch).await;
         let execution_time = proc_start.elapsed();
@@ -988,6 +1163,8 @@ where
         // 清空主通道
         while let Some(ch) = self.item_rx.recv().await {
             self.pending_count.fetch_sub(1, Ordering::Release);
+            // 唤醒一个阻塞的 submit 等待者
+            self.queue_notify.notify_one();
 
             // 跳过已过期 item
             if let Some(dl) = ch.deadline
@@ -1040,28 +1217,60 @@ where
                     let time_since_last_flush = self.last_flush_time.elapsed();
                     self.spawn_flush(time_since_last_flush);
                 }
-                // 等待所有 inflight task 完成
-                while let Some(result) = self.inflight.join_next().await {
-                    if let Err(e) = result {
-                        // task panic：记录日志，不 panic（shutdown 阶段尽力而为）
-                        let _msg = if e.is_panic() {
-                            "后台批处理 task panic"
-                        } else {
-                            "后台批处理 task 被取消"
-                        };
-                        event_at!(
-                            Level::ERROR,
-                            &self.config.tracing_level,
-                            error = _msg,
-                            "后台 task 异常退出"
-                        );
-                    }
-                }
+                // 等待所有 inflight task 完成（支持超时）
+                self.join_inflight_with_timeout().await;
                 // 处理剩余的 feedback，使用 handle_feedback 完整走指标+窗口流程
                 while let Ok(info) = self.feedback_rx.try_recv() {
                     self.handle_feedback(info).await;
                 }
             }
+        }
+
+        // 唤醒所有阻塞等待的 submit，让它们获取 Shutdown 错误
+        self.queue_notify.notify_waiters();
+    }
+
+    /// 等待所有 inflight task 完成，支持 drain_timeout 超时。
+    ///
+    /// 超时后自动 abort 剩余 task 并记录日志。
+    async fn join_inflight_with_timeout(&mut self) {
+        let join_all = async {
+            while let Some(result) = self.inflight.join_next().await {
+                Self::log_inflight_error(result, &self.config.tracing_level);
+            }
+        };
+
+        if let Some(timeout) = self.config.drain_timeout {
+            if tokio::time::timeout(timeout, join_all).await.is_err() {
+                self.inflight.abort_all();
+                event_at!(
+                    Level::WARN,
+                    &self.config.tracing_level,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "drain 超时，中止剩余 inflight task"
+                );
+                // 清理被中止的 task 结果
+                while let Some(result) = self.inflight.join_next().await {
+                    Self::log_inflight_error(result, &self.config.tracing_level);
+                }
+            }
+        } else {
+            join_all.await;
+        }
+    }
+
+    /// 记录 inflight task 的异常退出（panic 或取消）。
+    fn log_inflight_error(
+        result: Result<(), tokio::task::JoinError>,
+        tracing_level: &crate::trace::TraceLevel,
+    ) {
+        if let Err(e) = result {
+            let msg = if e.is_panic() {
+                "后台批处理 task panic"
+            } else {
+                "后台批处理 task 被取消"
+            };
+            event_at!(Level::ERROR, tracing_level, error = msg, "后台 task 异常退出");
         }
     }
 }

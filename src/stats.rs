@@ -7,6 +7,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+/// 累加器健康状态。
+#[derive(Debug, Clone)]
+pub struct AccumulatorHealth {
+    /// 累加器是否仍在接收 item（通道是否开放）。
+    pub is_accepting: bool,
+    /// 队列利用率: pending / max_queue_depth。无上限时为 0.0。
+    pub queue_utilization: f64,
+    /// 当前时间窗口大小。
+    pub current_window: Duration,
+    /// 并发模式下的飞行中批次数。
+    pub inflight_count: usize,
+    /// 因队列满被拒绝的总次数。
+    pub total_rejected: u64,
+}
+
 /// 延迟样本环形缓冲区容量。
 const MAX_LATENCY_SAMPLES: usize = 1000;
 
@@ -21,6 +36,8 @@ pub struct StatsSnapshot {
     pub total_dropped_timeout: u64,
     /// bypass 调用次数。
     pub total_bypassed: u64,
+    /// 因队列满被拒绝的提交次数。
+    pub total_rejected: u64,
     /// 通道中待接收的 item 数。
     pub queue_depth: usize,
     /// 缓冲区中的 item 数。
@@ -29,6 +46,8 @@ pub struct StatsSnapshot {
     pub inflight_count: usize,
     /// 当前批次总权重（未启用权重追踪时为 0）。
     pub current_weight: usize,
+    /// 当前时间窗口大小。
+    pub current_window: Duration,
     /// flush 执行时间 p50（中位数）。
     pub p50_latency: Duration,
     /// flush 执行时间 p99。
@@ -45,6 +64,7 @@ pub(crate) struct AccumulatorStats {
     pub total_flushed: AtomicU64,
     pub total_dropped_timeout: AtomicU64,
     pub total_bypassed: AtomicU64,
+    pub total_rejected: AtomicU64,
     /// 延迟样本，最多 MAX_LATENCY_SAMPLES 条。
     latency_samples: Mutex<Vec<Duration>>,
 }
@@ -57,6 +77,7 @@ impl AccumulatorStats {
             total_flushed: AtomicU64::new(0),
             total_dropped_timeout: AtomicU64::new(0),
             total_bypassed: AtomicU64::new(0),
+            total_rejected: AtomicU64::new(0),
             latency_samples: Mutex::new(Vec::with_capacity(MAX_LATENCY_SAMPLES)),
         }
     }
@@ -88,6 +109,11 @@ impl AccumulatorStats {
         self.total_bypassed.fetch_add(1, Ordering::Release);
     }
 
+    /// 记录一次因队列满被拒绝的提交。
+    pub fn record_rejected(&self) {
+        self.total_rejected.fetch_add(1, Ordering::Release);
+    }
+
     /// 构建统计快照。
     pub fn snapshot(
         &self,
@@ -95,6 +121,7 @@ impl AccumulatorStats {
         buffer_size: usize,
         inflight_count: usize,
         current_weight: usize,
+        current_window: Duration,
     ) -> StatsSnapshot {
         let samples: Vec<Duration> = self
             .latency_samples
@@ -109,10 +136,12 @@ impl AccumulatorStats {
             total_flushed: self.total_flushed.load(Ordering::Acquire),
             total_dropped_timeout: self.total_dropped_timeout.load(Ordering::Acquire),
             total_bypassed: self.total_bypassed.load(Ordering::Acquire),
+            total_rejected: self.total_rejected.load(Ordering::Acquire),
             queue_depth,
             buffer_size,
             inflight_count,
             current_weight,
+            current_window,
             p50_latency: p50,
             p99_latency: p99,
             avg_latency: avg,

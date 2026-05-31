@@ -29,6 +29,10 @@ pub struct Batch<T> {
     items: Vec<T>,
     batch_id: u64,
     created_at: Instant,
+    /// flush 时的窗口大小，供处理器了解调度上下文。
+    window_duration: Duration,
+    /// flush 时的通道队列深度，供处理器了解当前负载。
+    queue_depth_at_flush: usize,
 }
 
 impl<T> Batch<T> {
@@ -38,6 +42,24 @@ impl<T> Batch<T> {
             items,
             batch_id,
             created_at: Instant::now(),
+            window_duration: Duration::ZERO,
+            queue_depth_at_flush: 0,
+        }
+    }
+
+    /// 创建带上下文信息的新批次。
+    pub(crate) fn with_context(
+        items: Vec<T>,
+        batch_id: u64,
+        window_duration: Duration,
+        queue_depth_at_flush: usize,
+    ) -> Self {
+        Self {
+            items,
+            batch_id,
+            created_at: Instant::now(),
+            window_duration,
+            queue_depth_at_flush,
         }
     }
 
@@ -74,6 +96,16 @@ impl<T> Batch<T> {
     /// 批次从创建到现在经过的时间。
     pub fn age(&self) -> Duration {
         self.created_at.elapsed()
+    }
+
+    /// flush 时的窗口大小。处理器可据此了解调度上下文。
+    pub fn window_duration(&self) -> Duration {
+        self.window_duration
+    }
+
+    /// flush 时通道中待处理的 item 数。
+    pub fn queue_depth_at_flush(&self) -> usize {
+        self.queue_depth_at_flush
     }
 }
 
