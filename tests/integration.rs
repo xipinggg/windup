@@ -515,3 +515,142 @@ async fn test_serial_unchanged() {
 
     drop(handle);
 }
+
+// ─── tracing 可观测性集成测试 ───
+
+#[cfg(feature = "tracing")]
+mod tracing_tests {
+    use std::time::Duration;
+    use draft::prelude::*;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    /// 验证 tracing flush 事件正常发出（不 panic）
+    #[tokio::test]
+    async fn tracing_flush_events_emitted() {
+        // 使用 fmt subscriber 输出到 stderr（CI 友好）
+        let _guard = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer() // captures output to test
+            .set_default();
+
+        struct TestProcessor;
+        impl BatchProcessor<i32, String> for TestProcessor {
+            async fn process(&self, batch: Batch<i32>) -> Vec<String> {
+                batch.items().iter().map(|i| format!("done-{i}")).collect()
+            }
+        }
+
+        let config = AccumulatorConfig::new(
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_flush_empty_batches(false);
+
+        let (handle, accumulator) = config.build(
+            TestProcessor,
+            DefaultMetrics::new(),
+            FixedController::new(Duration::from_millis(100)),
+        );
+
+        let join = tokio::spawn(accumulator.run());
+
+        let reply = handle.submit(42).unwrap();
+        let result = reply.await.unwrap();
+        assert_eq!(result, "done-42");
+
+        handle.flush_now();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    /// 验证队列满时发出 WARN 事件
+    #[tokio::test]
+    async fn tracing_queue_full_warns() {
+        let _guard = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_test_writer()
+            .set_default();
+
+        struct TestProcessor;
+        impl BatchProcessor<i32, String> for TestProcessor {
+            async fn process(&self, batch: Batch<i32>) -> Vec<String> {
+                batch.items().iter().map(|i| format!("x-{i}")).collect()
+            }
+        }
+
+        let config = AccumulatorConfig::new(
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_max_queue_depth(2);
+
+        let (handle, accumulator) = config.build(
+            TestProcessor,
+            DefaultMetrics::new(),
+            FixedController::new(Duration::from_millis(100)),
+        );
+
+        let join = tokio::spawn(accumulator.run());
+
+        // 填满队列
+        handle.submit_no_wait(1).unwrap();
+        handle.submit_no_wait(2).unwrap();
+        let result = handle.submit_no_wait(3);
+        assert!(matches!(result, Err(AccumulatorError::QueueFull { .. })));
+
+        handle.flush_now();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        drop(handle);
+        let _ = join.await;
+    }
+
+    /// 验证 tracing 配置可通过 AccumulatorConfig 控制
+    #[tokio::test]
+    async fn tracing_config_integration() {
+        let _guard = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_test_writer()
+            .set_default();
+
+        struct TestProcessor;
+        impl BatchProcessor<i32, String> for TestProcessor {
+            async fn process(&self, batch: Batch<i32>) -> Vec<String> {
+                batch.items().iter().map(|i| format!("y-{i}")).collect()
+            }
+        }
+
+        // 使用 tracing 配置
+        let config = AccumulatorConfig::new(
+            Duration::from_millis(100),
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .with_trace_per_item(true); // 开启 per-item trace
+
+        let (handle, accumulator) = config.build(
+            TestProcessor,
+            DefaultMetrics::new(),
+            FixedController::new(Duration::from_millis(100)),
+        );
+
+        let join = tokio::spawn(accumulator.run());
+
+        let reply = handle.submit(99).unwrap();
+        let result = reply.await.unwrap();
+        assert_eq!(result, "y-99");
+
+        handle.flush_now();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        drop(handle);
+        let _ = join.await;
+    }
+}

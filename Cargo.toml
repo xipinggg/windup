@@ -15,3 +15,7 @@ tracing = ["dep:tracing"]
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = "0.3"
+
+[[example]]
+name = "tracing_demo"
+required-features = ["tracing"]
