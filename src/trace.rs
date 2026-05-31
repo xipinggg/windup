@@ -98,28 +98,61 @@ mod imp {
 
     /// feature 关闭时为零大小类型，编译器优化掉所有读写。
     pub(crate) type TraceLevel = ();
-    /// feature 关闭时为零大小类型。
-    pub(crate) type MaybeSpan = ();
+    /// 零大小 span 类型，提供与 tracing Span 兼容的方法签名。
+    /// feature 关闭时所有方法均为空操作。
+    #[derive(Clone, Copy)]
+    pub(crate) struct MaybeSpan;
+
+    impl MaybeSpan {
+        /// 进入 span（空操作），返回自身作为 guard。
+        #[inline]
+        pub(crate) fn entered(self) -> Self {
+            self
+        }
+
+        /// 建立 follows_from 关联（空操作）。
+        #[inline]
+        pub(crate) fn follows_from(&self, _: Self) {}
+
+        /// 将 future 包装到 span 中（空操作，直接返回 future）。
+        #[inline]
+        pub(crate) fn instrument<F: std::future::Future>(self, f: F) -> F {
+            f
+        }
+    }
+
     /// 占位类型，仅在 config 默认值构造时使用。
     pub(crate) type Level = ();
 
     #[inline]
-    pub(crate) fn current_span() -> MaybeSpan {}
+    pub(crate) fn current_span() -> MaybeSpan {
+        MaybeSpan
+    }
 
     #[inline]
-    pub(crate) fn run_span(_: Duration, _: Duration, _: &str) -> MaybeSpan {}
+    pub(crate) fn run_span(_: Duration, _: Duration, _: &str) -> MaybeSpan {
+        MaybeSpan
+    }
 
     #[inline]
-    pub(crate) fn batch_span(_: u64, _: usize, _: Duration, _: usize) -> MaybeSpan {}
+    pub(crate) fn batch_span(_: u64, _: usize, _: Duration, _: usize) -> MaybeSpan {
+        MaybeSpan
+    }
 
     #[inline]
-    pub(crate) fn item_span(_: usize) -> MaybeSpan {}
+    pub(crate) fn item_span(_: usize) -> MaybeSpan {
+        MaybeSpan
+    }
 
     #[inline]
-    pub(crate) fn bypass_span(_: u64, _: usize) -> MaybeSpan {}
+    pub(crate) fn bypass_span(_: u64, _: usize) -> MaybeSpan {
+        MaybeSpan
+    }
 
     #[inline]
-    pub(crate) fn drain_span(_: usize) -> MaybeSpan {}
+    pub(crate) fn drain_span(_: usize) -> MaybeSpan {
+        MaybeSpan
+    }
 
     #[inline]
     pub(crate) fn default_tracing_level() -> TraceLevel {

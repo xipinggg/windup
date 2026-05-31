@@ -13,6 +13,9 @@ use crate::controller::WindowController;
 use crate::error::AccumulatorError;
 use crate::metrics::{MetricsCollector, BYPASS_DRAIN_LIMIT};
 use crate::stats::{AccumulatorStats, StatsSnapshot};
+use crate::trace::event_at;
+#[cfg_attr(not(feature = "tracing"), allow(unused_imports))]
+use crate::trace::Level;
 
 use std::collections::VecDeque;
 
@@ -118,6 +121,13 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
         );
 
         if let Err(prev) = result {
+            event_at!(
+                Level::WARN,
+                &self.tracing_level,
+                max = self.max_queue_depth.unwrap_or(0),
+                pending = prev,
+                "队列已满，拒绝提交"
+            );
             return Err(AccumulatorError::QueueFull {
                 max: self.max_queue_depth.unwrap_or(0),
                 pending: prev,
@@ -164,6 +174,13 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
         );
 
         if let Err(prev) = result {
+            event_at!(
+                Level::WARN,
+                &self.tracing_level,
+                max = self.max_queue_depth.unwrap_or(0),
+                pending = prev,
+                "队列已满，拒绝提交"
+            );
             return Err(AccumulatorError::QueueFull {
                 max: self.max_queue_depth.unwrap_or(0),
                 pending: prev,
@@ -260,6 +277,13 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
         );
 
         if let Err(prev) = result {
+            event_at!(
+                Level::WARN,
+                &self.tracing_level,
+                max = self.max_queue_depth.unwrap_or(0),
+                pending = prev,
+                "队列已满，拒绝提交"
+            );
             return Err(AccumulatorError::QueueFull {
                 max: self.max_queue_depth.unwrap_or(0),
                 pending: prev,
@@ -348,6 +372,26 @@ where
 {
     /// 启动累加器主循环。
     pub async fn run(mut self) {
+        let concurrency_mode = match self.config.concurrency_mode {
+            ConcurrencyMode::Serial => "serial",
+            ConcurrencyMode::Concurrent { .. } => "concurrent",
+        };
+        let run_span = crate::trace::run_span(
+            self.config.min_window,
+            self.config.max_window,
+            concurrency_mode,
+        );
+
+        // Enter span for startup event — dropped before first await
+        {
+            let _run_guard = run_span.clone().entered();
+            event_at!(
+                Level::INFO,
+                &self.config.tracing_level,
+                "累加器启动"
+            );
+        }
+
         let mut deadline = Instant::now() + self.current_window;
         let mut running = true;
 
@@ -459,16 +503,42 @@ where
         }
 
         self.drain().await;
+
+        // Enter span for shutdown event（无后续 await）
+        {
+            let _run_guard = run_span.entered();
+            event_at!(
+                Level::INFO,
+                &self.config.tracing_level,
+                "累加器关闭"
+            );
+        }
     }
 
     // ─── private methods ───
 
     /// bypass item 直接交付，不参与指标/窗口。
     async fn process_bypass(&mut self, items: Vec<T>) {
+        let item_count = items.len();
+        let batch_id = self.next_batch_id;
+        self.next_batch_id += 1;
+
+        let bypass_span = crate::trace::bypass_span(batch_id, item_count);
+
+        // Enter span for startup event only — dropped before await
+        {
+            let _bypass_guard = bypass_span.entered();
+            event_at!(
+                Level::DEBUG,
+                &self.config.tracing_level,
+                batch_id,
+                item_count,
+                "bypass 处理开始"
+            );
+        }
+
         match self.config.concurrency_mode {
             ConcurrencyMode::Serial => {
-                let batch_id = self.next_batch_id;
-                self.next_batch_id += 1;
                 let batch = Batch::new(items, batch_id);
                 self.processor.process(batch).await;
             }
@@ -477,8 +547,6 @@ where
                 if max_inflight > 0
                     && self.inflight_count.load(Ordering::Acquire) >= max_inflight
                 {
-                    let batch_id = self.next_batch_id;
-                    self.next_batch_id += 1;
                     let batch = Batch::new(items, batch_id);
                     self.processor.process(batch).await;
                 } else {
@@ -579,13 +647,22 @@ where
                 self.flush_inner(time_since_last_flush).await;
 
                 let snapshot = self.metrics.snapshot();
-                self.current_window = self
+                let new_window = self
                     .controller
                     .adjust_window(self.current_window, &snapshot)
                     .await;
-                self.current_window = self
-                    .current_window
-                    .clamp(self.config.min_window, self.config.max_window);
+                let clamped = new_window.clamp(self.config.min_window, self.config.max_window);
+
+                if clamped != self.current_window {
+                    event_at!(
+                        Level::INFO,
+                        &self.config.tracing_level,
+                        prev_ms = self.current_window.as_millis() as u64,
+                        new_ms = clamped.as_millis() as u64,
+                        "窗口调整"
+                    );
+                }
+                self.current_window = clamped;
                 true
             }
             ConcurrencyMode::Concurrent { max_inflight } => {
@@ -610,10 +687,38 @@ where
         let batch_size = buffer_items.len();
         let total_weight = self.current_weight;
         self.current_weight = 0;
-        let (items, senders): (Vec<T>, Vec<ReplySender<R>>) =
-            buffer_items.into_iter().map(|bi| (bi.value, bi.reply)).unzip();
+
+        // Collect parent spans BEFORE consuming buffer_items
+        let parent_spans: Vec<crate::trace::MaybeSpan> = buffer_items
+            .iter()
+            .map(|bi| bi.parent_span.clone())
+            .collect();
+
+        let queue_depth = self.pending_count.load(Ordering::Acquire);
+        let batch_span = crate::trace::batch_span(
+            self.next_batch_id,
+            batch_size,
+            self.current_window,
+            queue_depth,
+        );
+
+        // Enter batch span for startup event only — dropped before await
+        {
+            let _batch_guard = batch_span.clone().entered();
+            event_at!(
+                Level::INFO,
+                &self.config.tracing_level,
+                batch_id = self.next_batch_id,
+                batch_size,
+                "批次处理开始"
+            );
+        }
+
+        // Now consume buffer_items into items and senders
         let batch_id = self.next_batch_id;
         self.next_batch_id += 1;
+        let (items, senders): (Vec<T>, Vec<ReplySender<R>>) =
+            buffer_items.into_iter().map(|bi| (bi.value, bi.reply)).unzip();
 
         let batch = Batch::new(items, batch_id);
         let proc_start = Instant::now();
@@ -627,14 +732,39 @@ where
             "BatchProcessor::process 返回 Vec 长度应与 batch 长度一致"
         );
 
-        // 发送结果给调用方
-        for (sender, result) in senders.into_iter().zip(results) {
+        let items_remaining = self.pending_count.load(Ordering::Acquire);
+
+        // 发送结果给调用方（在 batch span 内，以便 per-item spans 作为子 span）
+        {
+            let _batch_guard = batch_span.entered();
+
+            for (index, (sender, result)) in senders.into_iter().zip(results).enumerate() {
+            let _item_guard = if self.config.trace_per_item {
+                let span = crate::trace::item_span(index);
+                // Establish follows_from relationship to submitter's span
+                if index < parent_spans.len() {
+                    span.follows_from(parent_spans[index].clone());
+                }
+                Some(span.entered())
+            } else {
+                None
+            };
             if let Some(tx) = sender {
                 let _ = tx.send(Ok(result));
             }
         }
 
-        let items_remaining = self.pending_count.load(Ordering::Acquire);
+        event_at!(
+            Level::INFO,
+            &self.config.tracing_level,
+            batch_id = batch_id,
+            batch_size = batch_size,
+            execution_time_ms = execution_time.as_millis() as u64,
+            items_remaining = items_remaining,
+            window_ms = self.current_window.as_millis() as u64,
+            "批次处理完成"
+        );
+        }
 
         let info = FlushInfo {
             batch_size,
@@ -699,6 +829,12 @@ where
 
         if dropped_count > 0 {
             self.stats.record_dropped_timeout(dropped_count);
+            event_at!(
+                Level::WARN,
+                &self.config.tracing_level,
+                dropped = dropped_count,
+                "item 超时丢弃"
+            );
         }
     }
 
@@ -719,6 +855,20 @@ where
 
     /// 通道关闭后清空所有 item（包括 bypass 通道和 inflight task）。
     async fn drain(&mut self) {
+        let remaining = self.pending_count.load(Ordering::Acquire) + self.buffer.len();
+        let drain_span = crate::trace::drain_span(remaining);
+
+        // Enter span for startup event only — dropped before await
+        {
+            let _drain_guard = drain_span.entered();
+            event_at!(
+                Level::INFO,
+                &self.config.tracing_level,
+                remaining_items = remaining,
+                "开始清空累加器"
+            );
+        }
+
         // 清空主通道
         while let Some(ch) = self.item_rx.recv().await {
             self.pending_count.fetch_sub(1, Ordering::Release);
@@ -730,6 +880,11 @@ where
                         let _ = tx.send(Err(AccumulatorError::Timeout));
                     }
                     self.stats.record_dropped_timeout(1);
+                    event_at!(
+                        Level::WARN,
+                        &self.config.tracing_level,
+                        "drain 阶段 item 超时丢弃"
+                    );
                     continue;
                 }
 
