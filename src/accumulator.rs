@@ -541,6 +541,13 @@ where
             ConcurrencyMode::Serial => {
                 let batch = Batch::new(items, batch_id);
                 self.processor.process(batch).await;
+                event_at!(
+                    Level::DEBUG,
+                    &self.config.tracing_level,
+                    batch_id,
+                    item_count,
+                    "bypass 处理完成"
+                );
             }
             ConcurrencyMode::Concurrent { max_inflight } => {
                 // 检查并发上限，满时回退到同步处理
@@ -560,12 +567,42 @@ where
     fn spawn_bypass(&mut self, items: Vec<T>) {
         let batch_id = self.next_batch_id;
         self.next_batch_id += 1;
+        let item_count = items.len();
+        let _tracing_level = self.config.tracing_level;
+        let bypass_span = crate::trace::bypass_span(batch_id, item_count);
+
         let batch = Batch::new(items, batch_id);
         let processor = Arc::clone(&self.processor);
+        // InflightGuard: 构造时 +1，drop 时 -1（含 panic）
         let guard = InflightGuard::new(Arc::clone(&self.inflight_count));
 
         self.inflight.spawn(async move {
+            // Enter span for start event — NOT held across await
+            {
+                let _bypass_guard = bypass_span.clone().entered();
+                event_at!(
+                    Level::DEBUG,
+                    &_tracing_level,
+                    batch_id,
+                    item_count,
+                    "bypass 处理开始（并发）"
+                );
+            }
+
             processor.process(batch).await;
+
+            // Re-enter span for completion event
+            {
+                let _bypass_guard = bypass_span.entered();
+                event_at!(
+                    Level::DEBUG,
+                    &_tracing_level,
+                    batch_id,
+                    item_count,
+                    "bypass 处理完成（并发）"
+                );
+            }
+
             drop(guard); // 显式 drop，确保 panic 时也释放
         });
     }
@@ -576,11 +613,31 @@ where
         let batch_size = buffer_items.len();
         let total_weight = self.current_weight;
         self.current_weight = 0;
+
+        // 收集 parent_spans（在消费 buffer_items 之前）
+        let parent_spans: Vec<crate::trace::MaybeSpan> = buffer_items
+            .iter()
+            .map(|bi| bi.parent_span.clone())
+            .collect();
+
+        // 现在消费 buffer_items
         let (items, senders): (Vec<T>, Vec<ReplySender<R>>) =
             buffer_items.into_iter().map(|bi| (bi.value, bi.reply)).unzip();
 
         let batch_id = self.next_batch_id;
         self.next_batch_id += 1;
+
+        let queue_depth = self.pending_count.load(Ordering::Acquire);
+
+        // 在主 task 中创建 batch span，然后移动到后台 task
+        let batch_span = crate::trace::batch_span(
+            batch_id,
+            batch_size,
+            self.current_window,
+            queue_depth,
+        );
+        let _tracing_level = self.config.tracing_level;
+        let trace_per_item = self.config.trace_per_item;
 
         let batch = Batch::new(items, batch_id);
         let processor = Arc::clone(&self.processor);
@@ -593,27 +650,68 @@ where
 
         self.inflight.spawn(async move {
             let start = Instant::now();
-            let results = processor.process(batch).await;
-            let execution_time = start.elapsed();
+            let execution_time;
+            let items_remaining;
 
-            // 长度校验：processor 约定返回与 batch 等长的结果
-            debug_assert_eq!(
-                senders.len(),
-                results.len(),
-                "BatchProcessor::process 返回 Vec 长度应与 batch 长度一致"
-            );
-
-            // 逐个发送结果给调用方 ReplyHandle
-            for (sender, result) in senders
-                .into_iter()
-                .zip(results)
+            // Enter span for start event — NOT held across await
             {
-                if let Some(tx) = sender {
-                    let _ = tx.send(Ok(result));
-                }
+                let _batch_guard = batch_span.clone().entered();
+                event_at!(
+                    Level::INFO,
+                    &_tracing_level,
+                    batch_id,
+                    batch_size,
+                    "批次处理开始（并发）"
+                );
             }
 
-            let items_remaining = pending_count.load(Ordering::Acquire);
+            let results = processor.process(batch).await;
+            execution_time = start.elapsed();
+
+            // Re-enter span for per-item processing and completion event
+            {
+                let _batch_guard = batch_span.entered();
+
+                // 长度校验：processor 约定返回与 batch 等长的结果
+                debug_assert_eq!(
+                    senders.len(),
+                    results.len(),
+                    "BatchProcessor::process 返回 Vec 长度应与 batch 长度一致"
+                );
+
+                // 逐个发送结果 + per-item span
+                for (index, (sender, result)) in senders
+                    .into_iter()
+                    .zip(results)
+                    .enumerate()
+                {
+                    let _item_guard = if trace_per_item {
+                        let span = crate::trace::item_span(index);
+                        if index < parent_spans.len() {
+                            span.follows_from(parent_spans[index].clone());
+                        }
+                        Some(span.entered())
+                    } else {
+                        None
+                    };
+
+                    if let Some(tx) = sender {
+                        let _ = tx.send(Ok(result));
+                    }
+                }
+
+                items_remaining = pending_count.load(Ordering::Acquire);
+
+                event_at!(
+                    Level::INFO,
+                    &_tracing_level,
+                    batch_id,
+                    batch_size,
+                    execution_time_ms = execution_time.as_millis() as u64,
+                    items_remaining,
+                    "批次处理完成（并发）"
+                );
+            }
 
             let info = FlushInfo {
                 batch_size,
@@ -669,7 +767,14 @@ where
                 if max_inflight > 0
                     && self.inflight_count.load(Ordering::Acquire) >= max_inflight
                 {
-                    // 并发满，跳过本次 flush，items 保留在 buffer 中
+                    event_at!(
+                        Level::WARN,
+                        &self.config.tracing_level,
+                        max_inflight,
+                        inflight = self.inflight_count.load(Ordering::Acquire),
+                        buffered = self.buffer.len(),
+                        "并发满，跳过本次 flush"
+                    );
                     return false;
                 }
                 let time_since_last_flush = self.last_flush_time.elapsed();
@@ -794,9 +899,20 @@ where
             .controller
             .adjust_window(self.current_window, &snapshot)
             .await;
-        self.current_window = self
+        let clamped = self
             .current_window
             .clamp(self.config.min_window, self.config.max_window);
+
+        if clamped != self.current_window {
+            event_at!(
+                Level::INFO,
+                &self.config.tracing_level,
+                prev_ms = self.current_window.as_millis() as u64,
+                new_ms = clamped.as_millis() as u64,
+                "窗口调整"
+            );
+        }
+        self.current_window = clamped;
 
         // 若 buffer 有积压，通知主循环 flush
         if !self.buffer.is_empty() {
@@ -883,6 +999,7 @@ where
                     event_at!(
                         Level::WARN,
                         &self.config.tracing_level,
+                        dropped = 1u64,
                         "drain 阶段 item 超时丢弃"
                     );
                     continue;
@@ -927,12 +1044,17 @@ where
                 while let Some(result) = self.inflight.join_next().await {
                     if let Err(e) = result {
                         // task panic：记录日志，不 panic（shutdown 阶段尽力而为）
-                        let msg = if e.is_panic() {
+                        let _msg = if e.is_panic() {
                             "后台批处理 task panic"
                         } else {
                             "后台批处理 task 被取消"
                         };
-                        eprintln!("[draft] drain: {msg}");
+                        event_at!(
+                            Level::ERROR,
+                            &self.config.tracing_level,
+                            error = _msg,
+                            "后台 task 异常退出"
+                        );
                     }
                 }
                 // 处理剩余的 feedback，使用 handle_feedback 完整走指标+窗口流程
