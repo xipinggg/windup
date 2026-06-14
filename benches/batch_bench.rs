@@ -49,11 +49,13 @@ fn bench_throughput_serial(c: &mut Criterion) {
                 .unwrap()
                 .with_max_batch_size(128);
 
-                let (handle, accumulator) = config.build(
-                    NoopProcessor,
-                    DefaultMetrics::new(),
-                    FixedController::new(Duration::from_millis(200)),
-                );
+                let (handle, accumulator) = config
+                    .build(
+                        NoopProcessor,
+                        DefaultMetrics::new(),
+                        FixedController::new(Duration::from_millis(200)),
+                    )
+                    .unwrap();
 
                 let join = tokio::spawn(accumulator.run());
 
@@ -84,11 +86,13 @@ fn bench_large_batch(c: &mut Criterion) {
                 .unwrap()
                 .with_max_batch_size(10000);
 
-                let (handle, accumulator) = config.build(
-                    NoopProcessor,
-                    DefaultMetrics::new(),
-                    FixedController::new(Duration::from_millis(500)),
-                );
+                let (handle, accumulator) = config
+                    .build(
+                        NoopProcessor,
+                        DefaultMetrics::new(),
+                        FixedController::new(Duration::from_millis(500)),
+                    )
+                    .unwrap();
 
                 let join = tokio::spawn(accumulator.run());
 
@@ -121,11 +125,13 @@ fn bench_serial_vs_concurrent(c: &mut Criterion) {
                 .unwrap()
                 .with_concurrency_mode(ConcurrencyMode::Serial);
 
-                let (handle, accumulator) = config.build(
-                    SimulatedDelayProcessor,
-                    DefaultMetrics::new(),
-                    FixedController::new(Duration::from_millis(200)),
-                );
+                let (handle, accumulator) = config
+                    .build(
+                        SimulatedDelayProcessor,
+                        DefaultMetrics::new(),
+                        FixedController::new(Duration::from_millis(200)),
+                    )
+                    .unwrap();
 
                 let join = tokio::spawn(accumulator.run());
 
@@ -151,11 +157,13 @@ fn bench_serial_vs_concurrent(c: &mut Criterion) {
                 .unwrap()
                 .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 4 });
 
-                let (handle, accumulator) = config.build(
-                    SimulatedDelayProcessor,
-                    DefaultMetrics::new(),
-                    FixedController::new(Duration::from_millis(200)),
-                );
+                let (handle, accumulator) = config
+                    .build(
+                        SimulatedDelayProcessor,
+                        DefaultMetrics::new(),
+                        FixedController::new(Duration::from_millis(200)),
+                    )
+                    .unwrap();
 
                 let join = tokio::spawn(accumulator.run());
 
@@ -173,10 +181,5 @@ fn bench_serial_vs_concurrent(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_throughput_serial,
-    bench_large_batch,
-    bench_serial_vs_concurrent,
-);
+criterion_group!(benches, bench_throughput_serial, bench_large_batch, bench_serial_vs_concurrent,);
 criterion_main!(benches);

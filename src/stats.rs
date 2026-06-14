@@ -3,8 +3,8 @@
 //! 统计始终开启，可通过 [`AccumulatorHandle::stats`](crate::accumulator::AccumulatorHandle::stats)
 //! 和 [`AccumulatorHandle::health`](crate::accumulator::AccumulatorHandle::health) 获取运行快照和健康状态。
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// 累加器健康状态。
@@ -99,7 +99,9 @@ impl AccumulatorStats {
     /// 记录一次队列等待时间。
     pub fn record_wait(&self, wait: Duration) {
         if let Ok(mut samples) = self.wait_samples.lock() {
-            if samples.len() >= MAX_LATENCY_SAMPLES { samples.remove(0); }
+            if samples.len() >= MAX_LATENCY_SAMPLES {
+                samples.remove(0);
+            }
             samples.push(wait);
         }
     }
@@ -140,16 +142,10 @@ impl AccumulatorStats {
         current_weight: usize,
         current_window: Duration,
     ) -> StatsSnapshot {
-        let latency_samples: Vec<Duration> = self
-            .latency_samples
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_default();
-        let wait_samples: Vec<Duration> = self
-            .wait_samples
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_default();
+        let latency_samples: Vec<Duration> =
+            self.latency_samples.lock().map(|s| s.clone()).unwrap_or_default();
+        let wait_samples: Vec<Duration> =
+            self.wait_samples.lock().map(|s| s.clone()).unwrap_or_default();
 
         let (p50, p99, avg, max) = percentiles(&latency_samples);
         let (wp50, wp99, wavg, _) = percentiles(&wait_samples);
@@ -176,7 +172,10 @@ impl AccumulatorStats {
     }
 }
 
-/// 计算延迟样本的百分位数。
+/// 计算延迟样本的百分位数（线性插值法）。
+///
+/// 使用与 NumPy `method='linear'` 相同的算法：`rank = p/100 * (n-1)`，
+/// 对 rank 的整数部分和小数部分做线性插值。样本少时（如 2 条）p99 不再退化为 p50。
 fn percentiles(samples: &[Duration]) -> (Duration, Duration, Duration, Duration) {
     if samples.is_empty() {
         return (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
@@ -185,13 +184,33 @@ fn percentiles(samples: &[Duration]) -> (Duration, Duration, Duration, Duration)
     let mut sorted: Vec<&Duration> = samples.iter().collect();
     sorted.sort();
 
-    let len = sorted.len();
-    let p50 = sorted[(len - 1) * 50 / 100];
-    let p99 = sorted[(len - 1) * 99 / 100];
-    let max = sorted[len - 1];
+    let p50 = percentile_at(&sorted, 50.0);
+    let p99 = percentile_at(&sorted, 99.0);
+    let max = *sorted[sorted.len() - 1];
 
     let total_ns: u128 = samples.iter().map(|d| d.as_nanos()).sum();
+    let len = sorted.len();
     let avg = Duration::from_nanos((total_ns / len as u128) as u64);
 
-    (*p50, *p99, avg, *max)
+    (p50, p99, avg, max)
+}
+
+/// 计算给定百分位值（线性插值法）。
+///
+/// `p` 为 0..100 之间的值。样本数为 1 时直接返回该值。
+fn percentile_at(sorted: &[&Duration], p: f64) -> Duration {
+    let n = sorted.len();
+    if n == 1 {
+        return *sorted[0];
+    }
+    let rank = p * (n - 1) as f64 / 100.0;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        return *sorted[lower];
+    }
+    let frac = rank - lower as f64;
+    let lower_ns = sorted[lower].as_nanos() as f64;
+    let upper_ns = sorted[upper].as_nanos() as f64;
+    Duration::from_nanos((lower_ns + frac * (upper_ns - lower_ns)) as u64)
 }

@@ -28,16 +28,13 @@ impl<T: Send + 'static> BatchProcessor<T> for MockProcessor<T> {
 
 fn mock<T: Send + 'static>() -> (MockProcessor<T>, Batches<T>) {
     let batches = Arc::new(Mutex::new(Vec::new()));
-    let p = MockProcessor {
-        batches: Arc::clone(&batches),
-    };
+    let p = MockProcessor { batches: Arc::clone(&batches) };
     (p, batches)
 }
 
 fn cfg(ms: u64) -> AccumulatorConfig {
     let win = Duration::from_millis(ms);
-    AccumulatorConfig::new(win, Duration::from_millis(50), Duration::from_secs(30))
-        .unwrap()
+    AccumulatorConfig::new(win, Duration::from_millis(50), Duration::from_secs(30)).unwrap()
 }
 
 fn fixed(ms: u64) -> FixedController {
@@ -53,7 +50,7 @@ async fn test_basic_time_flush() {
     tokio::time::pause();
     let (proc, batches) = mock::<i32>();
     let config = cfg(100);
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100));
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100)).unwrap();
     tokio::spawn(accumulator.run());
 
     handle.send(1).unwrap();
@@ -76,7 +73,7 @@ async fn test_max_batch_size_early_flush() {
     tokio::time::pause();
     let (proc, batches) = mock::<i32>();
     let config = cfg(10_000).with_max_batch_size(3);
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000)).unwrap();
     tokio::spawn(accumulator.run());
 
     handle.send(1).unwrap();
@@ -100,7 +97,7 @@ async fn test_multiple_time_flushes() {
     tokio::time::pause();
     let (proc, batches) = mock::<i32>();
     let config = cfg(50);
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(50));
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(50)).unwrap();
     tokio::spawn(accumulator.run());
 
     handle.send(1).unwrap();
@@ -128,7 +125,7 @@ async fn test_drain_on_close() {
     tokio::time::pause();
     let (proc, batches) = mock::<i32>();
     let config = cfg(10_000);
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000)).unwrap();
     let jh = tokio::spawn(accumulator.run());
 
     handle.send(1).unwrap();
@@ -145,7 +142,7 @@ async fn test_drain_on_close() {
 async fn test_max_queue_depth() {
     let (proc, _batches) = mock::<i32>();
     let config = cfg(10_000).with_max_queue_depth(2);
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000)).unwrap();
     tokio::spawn(accumulator.run());
 
     handle.send(1).unwrap();
@@ -162,14 +159,11 @@ async fn test_empty_batch_suppression() {
     tokio::time::pause();
     let (proc, batches) = mock::<i32>();
     let config = cfg(50);
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(50));
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(50)).unwrap();
     tokio::spawn(accumulator.run());
 
     tick(Duration::from_millis(200)).await;
-    assert!(
-        batches.lock().unwrap().is_empty(),
-        "should suppress empty batches"
-    );
+    assert!(batches.lock().unwrap().is_empty(), "should suppress empty batches");
 
     drop(handle);
 }
@@ -179,7 +173,7 @@ async fn test_flush_empty_batches_enabled() {
     tokio::time::pause();
     let (proc, batches) = mock::<i32>();
     let config = cfg(50).with_flush_empty_batches(true);
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(50));
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(50)).unwrap();
     tokio::spawn(accumulator.run());
 
     tick(Duration::from_millis(200)).await;
@@ -195,7 +189,7 @@ async fn test_multi_producer() {
     tokio::time::pause();
     let (proc, batches) = mock::<usize>();
     let config = cfg(200);
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(200));
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(200)).unwrap();
     let jh = tokio::spawn(accumulator.run());
 
     const PRODUCERS: usize = 10;
@@ -237,7 +231,7 @@ async fn test_reply_single_result() {
     }
 
     let config = cfg(100);
-    let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(100));
+    let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(100)).unwrap();
     tokio::spawn(accumulator.run());
 
     let reply = handle.submit(21).unwrap();
@@ -254,16 +248,12 @@ async fn test_reply_multiple_results() {
     struct Upper;
     impl BatchProcessor<String, String> for Upper {
         async fn process(&self, batch: Batch<String>) -> Vec<String> {
-            batch
-                .into_inner()
-                .into_iter()
-                .map(|s| s.to_uppercase())
-                .collect()
+            batch.into_inner().into_iter().map(|s| s.to_uppercase()).collect()
         }
     }
 
     let config = cfg(200);
-    let (handle, accumulator) = config.build(Upper, DefaultMetrics::new(), fixed(200));
+    let (handle, accumulator) = config.build(Upper, DefaultMetrics::new(), fixed(200)).unwrap();
     tokio::spawn(accumulator.run());
 
     let r1 = handle.submit("hello".into()).unwrap();
@@ -288,7 +278,7 @@ async fn test_reply_on_shutdown() {
     }
 
     let config = cfg(10_000);
-    let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(10_000));
+    let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(10_000)).unwrap();
     let jh = tokio::spawn(accumulator.run());
 
     let reply = handle.submit(10).unwrap();
@@ -296,7 +286,7 @@ async fn test_reply_on_shutdown() {
 
     // 关闭后 reply 应该返回完成或 shutdown
     match reply.await {
-        Ok(20) => {} // drain 处理了
+        Ok(20) => {}                          // drain 处理了
         Err(AccumulatorError::Shutdown) => {} // 也可能是 shutdown
         other => panic!("unexpected result: {other:?}"),
     }
@@ -314,7 +304,7 @@ async fn test_reply_mixed_fire_and_forget() {
     }
 
     let config = cfg(200);
-    let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(200));
+    let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(200)).unwrap();
     tokio::spawn(accumulator.run());
 
     // fire-and-forget
@@ -338,9 +328,8 @@ async fn test_reply_mixed_fire_and_forget() {
 async fn test_concurrent_basic_time_flush() {
     tokio::time::pause();
     let (proc, batches) = mock::<i32>();
-    let config = cfg(100)
-        .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100));
+    let config = cfg(100).with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100)).unwrap();
     tokio::spawn(accumulator.run());
 
     handle.send(1).unwrap();
@@ -358,9 +347,8 @@ async fn test_concurrent_basic_time_flush() {
 async fn test_concurrent_drain_on_close() {
     tokio::time::pause();
     let (proc, batches) = mock::<i32>();
-    let config = cfg(10_000)
-        .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
+    let config = cfg(10_000).with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000)).unwrap();
     let jh = tokio::spawn(accumulator.run());
 
     handle.send(1).unwrap();
@@ -377,9 +365,8 @@ async fn test_concurrent_drain_on_close() {
 async fn test_concurrent_multi_producer() {
     tokio::time::pause();
     let (proc, batches) = mock::<usize>();
-    let config = cfg(200)
-        .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(200));
+    let config = cfg(200).with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(200)).unwrap();
     let jh = tokio::spawn(accumulator.run());
 
     const PRODUCERS: usize = 10;
@@ -412,7 +399,7 @@ async fn test_concurrent_max_batch_size() {
     let config = cfg(10_000)
         .with_max_batch_size(3)
         .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000));
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(10_000)).unwrap();
     tokio::spawn(accumulator.run());
 
     handle.send(1).unwrap();
@@ -445,13 +432,11 @@ async fn test_concurrent_max_inflight_limit() {
     }
 
     let batches: Batches<i32> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let proc = SlowProcessor {
-        batches: Arc::clone(&batches),
-    };
+    let proc = SlowProcessor { batches: Arc::clone(&batches) };
 
     // max_inflight=1，窗口很长
     let config = AccumulatorConfig::new(
-        Duration::from_millis(20),  // 短窗口，快速触发 timer
+        Duration::from_millis(20), // 短窗口，快速触发 timer
         Duration::from_millis(10),
         Duration::from_secs(10),
     )
@@ -459,7 +444,7 @@ async fn test_concurrent_max_inflight_limit() {
     .with_max_batch_size(1) // 每个 item 单独一个 batch
     .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 1 });
 
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(20));
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(20)).unwrap();
     tokio::spawn(accumulator.run());
 
     // 快速提交多个 item
@@ -488,9 +473,8 @@ async fn test_concurrent_with_reply() {
         }
     }
 
-    let config = cfg(200)
-        .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
-    let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(200));
+    let config = cfg(200).with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 0 });
+    let (handle, accumulator) = config.build(Double, DefaultMetrics::new(), fixed(200)).unwrap();
     tokio::spawn(accumulator.run());
 
     let r1 = handle.submit(10).unwrap();
@@ -508,7 +492,7 @@ async fn test_serial_unchanged() {
     let (proc, batches) = mock::<i32>();
     // 不设置 concurrency_mode，默认 Serial
     let config = cfg(100);
-    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100));
+    let (handle, accumulator) = config.build(proc, DefaultMetrics::new(), fixed(100)).unwrap();
     tokio::spawn(accumulator.run());
 
     handle.send(1).unwrap();
@@ -530,8 +514,8 @@ async fn test_serial_unchanged() {
 #[cfg(feature = "tracing")]
 mod tracing_tests {
     use std::time::Duration;
-    use windup::prelude::*;
     use tracing_subscriber::util::SubscriberInitExt;
+    use windup::prelude::*;
 
     /// 验证 tracing flush 事件正常发出（不 panic）
     #[tokio::test]
@@ -557,11 +541,13 @@ mod tracing_tests {
         .unwrap()
         .with_flush_empty_batches(false);
 
-        let (handle, accumulator) = config.build(
-            TestProcessor,
-            DefaultMetrics::new(),
-            FixedController::new(Duration::from_millis(100)),
-        );
+        let (handle, accumulator) = config
+            .build(
+                TestProcessor,
+                DefaultMetrics::new(),
+                FixedController::new(Duration::from_millis(100)),
+            )
+            .unwrap();
 
         let join = tokio::spawn(accumulator.run());
 
@@ -599,11 +585,13 @@ mod tracing_tests {
         .unwrap()
         .with_max_queue_depth(2);
 
-        let (handle, accumulator) = config.build(
-            TestProcessor,
-            DefaultMetrics::new(),
-            FixedController::new(Duration::from_millis(100)),
-        );
+        let (handle, accumulator) = config
+            .build(
+                TestProcessor,
+                DefaultMetrics::new(),
+                FixedController::new(Duration::from_millis(100)),
+            )
+            .unwrap();
 
         let join = tokio::spawn(accumulator.run());
 
@@ -644,11 +632,13 @@ mod tracing_tests {
         .unwrap()
         .with_trace_per_item(true); // 开启 per-item trace
 
-        let (handle, accumulator) = config.build(
-            TestProcessor,
-            DefaultMetrics::new(),
-            FixedController::new(Duration::from_millis(100)),
-        );
+        let (handle, accumulator) = config
+            .build(
+                TestProcessor,
+                DefaultMetrics::new(),
+                FixedController::new(Duration::from_millis(100)),
+            )
+            .unwrap();
 
         let join = tokio::spawn(accumulator.run());
 
@@ -676,11 +666,13 @@ async fn test_submit_or_wait_waits_for_slot() {
     .unwrap()
     .with_max_queue_depth(1);
 
-    let (handle, accumulator) = config.build(
-        StringProcessor,
-        DefaultMetrics::new(),
-        FixedController::new(Duration::from_millis(200)),
-    );
+    let (handle, accumulator) = config
+        .build(
+            StringProcessor,
+            DefaultMetrics::new(),
+            FixedController::new(Duration::from_millis(200)),
+        )
+        .unwrap();
 
     let join = tokio::spawn(accumulator.run());
 
@@ -689,9 +681,8 @@ async fn test_submit_or_wait_waits_for_slot() {
 
     // 阻塞提交：应该等待 slot 释放后成功
     let h2 = handle.clone();
-    let blocking_result = tokio::spawn(async move {
-        h2.submit_or_wait(2, Duration::from_secs(5)).await
-    });
+    let blocking_result =
+        tokio::spawn(async move { h2.submit_or_wait(2, Duration::from_secs(5)).await });
 
     // 稍等后触发 flush 释放 slot
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -715,11 +706,13 @@ async fn test_send_or_wait_waits() {
     .unwrap()
     .with_max_queue_depth(1);
 
-    let (handle, accumulator) = config.build(
-        StringProcessor,
-        DefaultMetrics::new(),
-        FixedController::new(Duration::from_millis(200)),
-    );
+    let (handle, accumulator) = config
+        .build(
+            StringProcessor,
+            DefaultMetrics::new(),
+            FixedController::new(Duration::from_millis(200)),
+        )
+        .unwrap();
 
     let join = tokio::spawn(accumulator.run());
 
@@ -728,9 +721,8 @@ async fn test_send_or_wait_waits() {
 
     // send_or_wait 应等待 slot
     let h2 = handle.clone();
-    let blocking_task = tokio::spawn(async move {
-        h2.send_or_wait(2, Duration::from_secs(5)).await
-    });
+    let blocking_task =
+        tokio::spawn(async move { h2.send_or_wait(2, Duration::from_secs(5)).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     handle.flush_now();
@@ -755,11 +747,13 @@ async fn test_drain_timeout_does_not_hang() {
     .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 1 })
     .with_drain_timeout(Some(Duration::from_millis(500)));
 
-    let (handle, accumulator) = config.build(
-        SlowProcessor { delay: Duration::from_secs(10) },
-        DefaultMetrics::new(),
-        FixedController::new(Duration::from_millis(200)),
-    );
+    let (handle, accumulator) = config
+        .build(
+            SlowProcessor { delay: Duration::from_secs(10) },
+            DefaultMetrics::new(),
+            FixedController::new(Duration::from_millis(200)),
+        )
+        .unwrap();
 
     let join = tokio::spawn(accumulator.run());
 
@@ -801,13 +795,13 @@ async fn test_batch_context_fields() {
     )
     .unwrap();
 
-    let (handle, accumulator) = config.build(
-        ContextCheckProcessor {
-            seen: Arc::clone(&seen),
-        },
-        DefaultMetrics::new(),
-        FixedController::new(Duration::from_millis(100)),
-    );
+    let (handle, accumulator) = config
+        .build(
+            ContextCheckProcessor { seen: Arc::clone(&seen) },
+            DefaultMetrics::new(),
+            FixedController::new(Duration::from_millis(100)),
+        )
+        .unwrap();
 
     let join = tokio::spawn(accumulator.run());
 
@@ -835,11 +829,13 @@ async fn test_health_reflects_state() {
     .unwrap()
     .with_max_queue_depth(10);
 
-    let (handle, accumulator) = config.build(
-        StringProcessor,
-        DefaultMetrics::new(),
-        FixedController::new(Duration::from_millis(200)),
-    );
+    let (handle, accumulator) = config
+        .build(
+            StringProcessor,
+            DefaultMetrics::new(),
+            FixedController::new(Duration::from_millis(200)),
+        )
+        .unwrap();
 
     let join = tokio::spawn(accumulator.run());
 
@@ -864,11 +860,13 @@ async fn test_rejected_counter_increments() {
     .unwrap()
     .with_max_queue_depth(1);
 
-    let (handle, accumulator) = config.build(
-        StringProcessor,
-        DefaultMetrics::new(),
-        FixedController::new(Duration::from_millis(200)),
-    );
+    let (handle, accumulator) = config
+        .build(
+            StringProcessor,
+            DefaultMetrics::new(),
+            FixedController::new(Duration::from_millis(200)),
+        )
+        .unwrap();
 
     let join = tokio::spawn(accumulator.run());
 
@@ -896,11 +894,13 @@ async fn test_send_fire_and_forget() {
     )
     .unwrap();
 
-    let (handle, accumulator) = config.build(
-        StringProcessor,
-        DefaultMetrics::new(),
-        FixedController::new(Duration::from_millis(200)),
-    );
+    let (handle, accumulator) = config
+        .build(
+            StringProcessor,
+            DefaultMetrics::new(),
+            FixedController::new(Duration::from_millis(200)),
+        )
+        .unwrap();
 
     let join = tokio::spawn(accumulator.run());
 
@@ -909,6 +909,90 @@ async fn test_send_fire_and_forget() {
 
     drop(handle);
     let _ = join.await;
+}
+
+// ─── TryBatchProcessor ───
+
+#[derive(Debug, PartialEq)]
+struct TryError(&'static str);
+
+struct FailingEveryOther;
+
+impl TryBatchProcessor<i32, String> for FailingEveryOther {
+    type Error = TryError;
+
+    async fn try_process(&self, batch: Batch<i32>) -> Vec<Result<String, TryError>> {
+        batch
+            .items()
+            .iter()
+            .enumerate()
+            .map(|(i, v)| if i % 2 == 0 { Ok(format!("ok-{v}")) } else { Err(TryError("odd")) })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn test_try_batch_processor_returns_results() {
+    tokio::time::pause();
+    let config = cfg(200);
+    let (handle, accumulator) =
+        config.build_try(FailingEveryOther, DefaultMetrics::new(), fixed(200)).unwrap();
+    tokio::spawn(accumulator.run());
+
+    let r1 = handle.submit(1).unwrap();
+    let r2 = handle.submit(2).unwrap();
+    let r3 = handle.submit(3).unwrap();
+
+    assert_eq!(r1.await.unwrap().unwrap(), "ok-1");
+    assert!(r2.await.unwrap().is_err());
+    assert_eq!(r3.await.unwrap().unwrap(), "ok-3");
+
+    drop(handle);
+}
+
+// ─── 配置校验 ───
+
+#[tokio::test]
+async fn test_config_rejects_zero_limits() {
+    let base = AccumulatorConfig::new(
+        Duration::from_millis(200),
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+
+    assert!(
+        base.clone()
+            .with_max_batch_size(0)
+            .build(
+                StringProcessor,
+                DefaultMetrics::new(),
+                FixedController::new(Duration::from_millis(200)),
+            )
+            .is_err()
+    );
+
+    assert!(
+        base.clone()
+            .with_max_queue_depth(0)
+            .build(
+                StringProcessor,
+                DefaultMetrics::new(),
+                FixedController::new(Duration::from_millis(200)),
+            )
+            .is_err()
+    );
+
+    assert!(
+        base.with_max_batch_weight(0)
+            .build_with_weight(
+                StringProcessor,
+                DefaultMetrics::new(),
+                FixedController::new(Duration::from_millis(200)),
+                |_| 1,
+            )
+            .is_err()
+    );
 }
 
 // ─── 辅助处理器 ───

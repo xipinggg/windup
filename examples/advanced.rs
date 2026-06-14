@@ -33,11 +33,13 @@ async fn main() {
     .with_max_batch_size(20)
     .with_max_queue_depth(100);
 
-    let (handle, _jh) = config.build_and_spawn(
-        LoggingProcessor,
-        DefaultMetrics::new(),
-        PIDController::new(0.8, 0.15, 0.01, 0.05).unwrap(),
-    );
+    let (handle, _jh) = config
+        .build_and_spawn(
+            LoggingProcessor,
+            DefaultMetrics::new(),
+            PIDController::new(0.8, 0.15, 0.01, 0.05).unwrap(),
+        )
+        .unwrap();
 
     // 1. 正常提交
     println!("=== 1. 正常提交 ===");
@@ -74,7 +76,7 @@ async fn main() {
     );
 
     // 6. 取消
-    println!("\n=== 5. 取消 ===");
+    println!("\n=== 6. 取消 ===");
     handle.cancel();
     tokio::time::sleep(Duration::from_millis(200)).await;
 

@@ -1,13 +1,13 @@
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use tokio::sync::Notify;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::accumulator::{AccumulatorHandle, BatchAccumulator};
-use crate::batch::{BatchProcessor, FlushInfo};
+use crate::batch::{BatchProcessor, FlushInfo, TryBatchAdapter, TryBatchProcessor};
 use crate::controller::WindowController;
 use crate::error::AccumulatorError;
 use crate::metrics::MetricsCollector;
@@ -55,6 +55,9 @@ pub struct AccumulatorConfig {
 }
 
 impl AccumulatorConfig {
+    /// 主循环每轮非阻塞 drain 的默认上限。
+    pub(crate) const DEFAULT_DRAIN_BATCH_LIMIT: usize = 64;
+
     /// 创建新配置。
     ///
     /// # Errors
@@ -91,8 +94,33 @@ impl AccumulatorConfig {
             tracing_level: crate::trace::default_tracing_level(),
             trace_per_item: false,
             drain_timeout: None,
-            drain_batch_limit: 64,
+            drain_batch_limit: Self::DEFAULT_DRAIN_BATCH_LIMIT,
         })
+    }
+
+    /// 校验容量限制类参数是否为 0。
+    fn validate_limits(&self) -> Result<(), AccumulatorError> {
+        if self.max_batch_size == Some(0) {
+            return Err(AccumulatorError::InvalidConfig {
+                reason: "max_batch_size must be > 0".into(),
+            });
+        }
+        if self.max_queue_depth == Some(0) {
+            return Err(AccumulatorError::InvalidConfig {
+                reason: "max_queue_depth must be > 0".into(),
+            });
+        }
+        if self.max_batch_weight == Some(0) {
+            return Err(AccumulatorError::InvalidConfig {
+                reason: "max_batch_weight must be > 0".into(),
+            });
+        }
+        if self.drain_batch_limit == 0 {
+            return Err(AccumulatorError::InvalidConfig {
+                reason: "drain_batch_limit must be > 0".into(),
+            });
+        }
+        Ok(())
     }
 
     /// 设置最大批次大小。达到此大小时立即 flush，不等时间窗口到期。
@@ -173,7 +201,7 @@ impl AccumulatorConfig {
         processor: P,
         metrics: M,
         controller: C,
-    ) -> (AccumulatorHandle<T, R>, tokio::task::JoinHandle<()>)
+    ) -> Result<(AccumulatorHandle<T, R>, tokio::task::JoinHandle<()>), AccumulatorError>
     where
         T: Send + 'static,
         R: Send + 'static,
@@ -181,9 +209,9 @@ impl AccumulatorConfig {
         M: MetricsCollector,
         C: WindowController,
     {
-        let (handle, accumulator) = self.build(processor, metrics, controller);
+        let (handle, accumulator) = self.build(processor, metrics, controller)?;
         let join = tokio::spawn(accumulator.run());
-        (handle, join)
+        Ok((handle, join))
     }
 
     /// 消费配置，构建 [`AccumulatorHandle`] 和 [`BatchAccumulator`]（无权重追踪）。
@@ -195,7 +223,7 @@ impl AccumulatorConfig {
         processor: P,
         metrics: M,
         controller: C,
-    ) -> (AccumulatorHandle<T, R>, BatchAccumulator<T, R, P, M, C>)
+    ) -> Result<(AccumulatorHandle<T, R>, BatchAccumulator<T, R, P, M, C>), AccumulatorError>
     where
         T: Send + 'static,
         R: Send + 'static,
@@ -216,7 +244,7 @@ impl AccumulatorConfig {
         metrics: M,
         controller: C,
         weight_fn: impl Fn(&T) -> usize + Send + Sync + 'static,
-    ) -> (AccumulatorHandle<T, R>, BatchAccumulator<T, R, P, M, C>)
+    ) -> Result<(AccumulatorHandle<T, R>, BatchAccumulator<T, R, P, M, C>), AccumulatorError>
     where
         T: Send + 'static,
         R: Send + 'static,
@@ -224,6 +252,7 @@ impl AccumulatorConfig {
         M: MetricsCollector,
         C: WindowController,
     {
+        self.validate_limits()?;
         let (tx, rx) = mpsc::unbounded_channel();
         let (bypass_tx, bypass_rx) = mpsc::unbounded_channel();
         let (feedback_tx, feedback_rx) = mpsc::unbounded_channel::<FlushInfo>();
@@ -267,7 +296,56 @@ impl AccumulatorConfig {
             shared,
         };
 
-        (handle, accumulator)
+        Ok((handle, accumulator))
+    }
+
+    /// 消费配置，构建支持 [`TryBatchProcessor`] 的累加器。
+    ///
+    /// 每个 item 的处理结果通过 [`ReplyHandle`] 返回 `Result<Result<R, E>, AccumulatorError>`，
+    /// 其中内层 `Result<R, E>` 来自用户处理器的逐 item 错误。
+    #[allow(clippy::type_complexity)]
+    pub fn build_try<T, R, E, P, M, C>(
+        self,
+        processor: P,
+        metrics: M,
+        controller: C,
+    ) -> Result<
+        (
+            AccumulatorHandle<T, Result<R, E>>,
+            BatchAccumulator<T, Result<R, E>, TryBatchAdapter<P>, M, C>,
+        ),
+        AccumulatorError,
+    >
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+        E: Send + 'static,
+        P: TryBatchProcessor<T, R, Error = E> + Sync,
+        M: MetricsCollector,
+        C: WindowController,
+    {
+        self.build_with_weight(TryBatchAdapter::new(processor), metrics, controller, |_| 1)
+    }
+
+    /// 消费配置，构建并启动支持 [`TryBatchProcessor`] 的累加器。
+    #[allow(clippy::type_complexity)]
+    pub fn build_and_spawn_try<T, R, E, P, M, C>(
+        self,
+        processor: P,
+        metrics: M,
+        controller: C,
+    ) -> Result<(AccumulatorHandle<T, Result<R, E>>, tokio::task::JoinHandle<()>), AccumulatorError>
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+        E: Send + 'static,
+        P: TryBatchProcessor<T, R, Error = E> + Sync,
+        M: MetricsCollector,
+        C: WindowController,
+    {
+        let (handle, accumulator) = self.build_try(processor, metrics, controller)?;
+        let join = tokio::spawn(accumulator.run());
+        Ok((handle, join))
     }
 }
 
@@ -285,7 +363,7 @@ impl Default for AccumulatorConfig {
             tracing_level: crate::trace::default_tracing_level(),
             trace_per_item: false,
             drain_timeout: None,
-            drain_batch_limit: 64,
+            drain_batch_limit: Self::DEFAULT_DRAIN_BATCH_LIMIT,
         }
     }
 }

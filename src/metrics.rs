@@ -13,7 +13,10 @@ pub struct MetricsSnapshot {
     pub batch_utilization_rate: f64,
     /// 通道中待处理的消息数。
     pub queue_depth: usize,
-    /// 当前 buffer 中的 item 数。
+    /// 最近一次 flush 的 batch_size，作为 buffer 负载的代理指标。
+    ///
+    /// 指标收集器通常无法实时拿到 accumulator 内部 buffer 的当前长度，
+    /// 因此复用最近一次 flush 的批次大小供控制器参考。
     pub buffer_size: usize,
     /// EMA 平滑执行时间（动态基准）。
     pub avg_execution_time: Duration,
@@ -87,11 +90,7 @@ impl Default for DefaultMetrics {
 impl MetricsCollector for DefaultMetrics {
     fn record_flush(&mut self, info: &FlushInfo) {
         let actual_util = if let Some(max) = info.max_batch_size {
-            if max == 0 {
-                0.0
-            } else {
-                (info.batch_size as f64 / max as f64).min(1.0)
-            }
+            if max == 0 { 0.0 } else { (info.batch_size as f64 / max as f64).min(1.0) }
         } else {
             0.0
         };
@@ -109,24 +108,13 @@ impl MetricsCollector for DefaultMetrics {
     }
 
     fn snapshot(&self) -> MetricsSnapshot {
-        let last_exec = self
-            .last_flush_info
-            .as_ref()
-            .map(|f| f.execution_time)
-            .unwrap_or(Duration::ZERO);
+        let last_exec =
+            self.last_flush_info.as_ref().map(|f| f.execution_time).unwrap_or(Duration::ZERO);
 
         MetricsSnapshot {
             batch_utilization_rate: self.smoothed_utilization,
-            queue_depth: self
-                .last_flush_info
-                .as_ref()
-                .map(|f| f.items_remaining)
-                .unwrap_or(0),
-            buffer_size: self
-                .last_flush_info
-                .as_ref()
-                .map(|f| f.batch_size)
-                .unwrap_or(0),
+            queue_depth: self.last_flush_info.as_ref().map(|f| f.items_remaining).unwrap_or(0),
+            buffer_size: self.last_flush_info.as_ref().map(|f| f.batch_size).unwrap_or(0),
             avg_execution_time: self.smoothed_execution_time,
             last_execution_time: last_exec,
         }

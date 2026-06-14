@@ -1,7 +1,7 @@
 use std::time::Duration;
-use windup::prelude::*;
 use tracing::Level;
 use tracing_subscriber::fmt;
+use windup::prelude::*;
 
 struct DemoProcessor;
 
@@ -15,10 +15,7 @@ impl BatchProcessor<i32, String> for DemoProcessor {
 #[tokio::main]
 async fn main() {
     // 初始化 subscriber，输出格式化的日志
-    fmt()
-        .with_max_level(Level::DEBUG)
-        .with_target(false)
-        .init();
+    fmt().with_max_level(Level::DEBUG).with_target(false).init();
 
     let config = AccumulatorConfig::new(
         Duration::from_millis(200),
@@ -29,11 +26,9 @@ async fn main() {
     .with_max_batch_size(10)
     .with_trace_per_item(true);
 
-    let (handle, accumulator) = config.build(
-        DemoProcessor,
-        DefaultMetrics::new(),
-        AdaptiveController::new(0.8, 0.1).unwrap(),
-    );
+    let (handle, accumulator) = config
+        .build(DemoProcessor, DefaultMetrics::new(), AdaptiveController::new(0.8, 0.1).unwrap())
+        .unwrap();
 
     let join = tokio::spawn(accumulator.run());
 

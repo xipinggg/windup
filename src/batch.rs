@@ -48,6 +48,69 @@ impl<T: Send, R: Send, P: BatchProcessor<T, R> + Sync> TryBatchProcessor<T, R> f
     }
 }
 
+/// 将 [`TryBatchProcessor`] 适配为 [`BatchProcessor`] 的包装器。
+///
+/// 由于累加器主循环需要明确的 `Vec<R>` 返回契约，
+/// `TryBatchProcessor` 不能直接作为 processor 传入。
+/// 通过此适配器，每个 item 的 `Result<R, E>` 整体作为 `BatchProcessor` 的
+/// 结果类型 `R' = Result<R, E>`，从而接入累加器。
+///
+/// 调用方通过 [`ReplyHandle`] 拿到 `Result<Result<R, E>, AccumulatorError>`。
+///
+/// # 示例
+///
+/// ```rust,ignore
+/// use windup::prelude::*;
+///
+/// struct MyTryProcessor;
+/// impl TryBatchProcessor<i32, String> for MyTryProcessor {
+///     type Error = std::io::Error;
+///     async fn try_process(&self, batch: Batch<i32>) -> Vec<Result<String, std::io::Error>> {
+///         batch.items().iter().map(|i| Ok(format!("ok-{i}"))).collect()
+///     }
+/// }
+///
+/// let config = AccumulatorConfig::new(
+///     Duration::from_millis(200),
+///     Duration::from_millis(50),
+///     Duration::from_secs(5),
+/// ).unwrap();
+///
+/// let (handle, accumulator) = config.build_try(
+///     MyTryProcessor,
+///     DefaultMetrics::new(),
+///     FixedController::new(Duration::from_millis(200)),
+/// ).unwrap();
+/// ```
+#[derive(Debug, Clone)]
+pub struct TryBatchAdapter<P> {
+    inner: P,
+}
+
+impl<P> TryBatchAdapter<P> {
+    /// 创建新的适配器。
+    pub fn new(inner: P) -> Self {
+        Self { inner }
+    }
+
+    /// 返回内部处理器。
+    pub fn into_inner(self) -> P {
+        self.inner
+    }
+}
+
+impl<T, R, E, P> BatchProcessor<T, Result<R, E>> for TryBatchAdapter<P>
+where
+    T: Send,
+    R: Send,
+    E: Send + 'static,
+    P: TryBatchProcessor<T, R, Error = E> + Sync,
+{
+    async fn process(&self, batch: Batch<T>) -> Vec<Result<R, E>> {
+        self.inner.try_process(batch).await
+    }
+}
+
 /// 一个待处理的批次。
 ///
 /// 包含在时间窗口内收集到的所有 item。
@@ -70,13 +133,7 @@ impl<T> Batch<T> {
         window_duration: Duration,
         queue_depth_at_flush: usize,
     ) -> Self {
-        Self {
-            items,
-            batch_id,
-            created_at: Instant::now(),
-            window_duration,
-            queue_depth_at_flush,
-        }
+        Self { items, batch_id, created_at: Instant::now(), window_duration, queue_depth_at_flush }
     }
 
     /// 消耗批次，返回内部 item 列表。

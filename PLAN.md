@@ -11,22 +11,42 @@ src/
 ├── lib.rs           -- 顶层 re-export + prelude
 ├── error.rs         -- AccumulatorError 错误类型
 ├── config.rs        -- AccumulatorConfig builder（非泛型）
-├── batch.rs         -- Batch<T>, FlushInfo, BatchProcessor trait
+├── batch.rs         -- Batch<T>, FlushInfo, BatchProcessor, TryBatchProcessor
 ├── metrics.rs       -- MetricsCollector trait, MetricsSnapshot, DefaultMetrics
-├── controller.rs    -- WindowController trait + 4 种内置控制器
+├── controller.rs    -- WindowController trait + 5 种内置控制器
+├── stats.rs         -- StatsSnapshot + AccumulatorHealth
+├── trace.rs         -- tracing 可观测性（span/event，feature 可关闭）
 └── accumulator.rs   -- BatchAccumulator 主循环 + AccumulatorHandle
 ```
 
 ## 核心 Trait 与类型
 
-### BatchProcessor<T>
+### BatchProcessor<T, R>
+
 ```rust
-pub trait BatchProcessor<T: Send>: Send + 'static {
-    fn process(&self, batch: Batch<T>) -> impl Future<Output = ()> + Send;
+pub trait BatchProcessor<T: Send, R: Send = ()>: Send + 'static {
+    fn process(&self, batch: Batch<T>) -> impl Future<Output = Vec<R>> + Send;
 }
 ```
 
+### TryBatchProcessor<T, R>
+
+可失败的批处理器，每个 item 返回独立的 `Result<R, Self::Error>`。
+
+```rust
+pub trait TryBatchProcessor<T: Send, R: Send = ()>: Send + 'static {
+    type Error: Send + 'static;
+    fn try_process(&self, batch: Batch<T>) -> impl Future<Output = Vec<Result<R, Self::Error>>> + Send;
+}
+```
+
+由于累加器主循环需要明确知道如何处理错误，`TryBatchProcessor` 不能直接作为 processor 传入。提供两种方式使用：
+
+1. **TryBatchAdapter**：把 `TryBatchProcessor` 包装成 `BatchProcessor`，错误统一映射为 `AccumulatorError`。
+2. **`AccumulatorConfig::build_try`**：直接构建接受 `TryBatchProcessor` 的 accumulator，错误通过 `ReplyHandle` 返回。
+
 ### FlushInfo
+
 ```rust
 pub struct FlushInfo {
     pub batch_size: usize,
@@ -35,52 +55,64 @@ pub struct FlushInfo {
     pub items_remaining: usize,
     pub batch_id: u64,
     pub execution_time: Duration,   // process() 耗时
+    pub time_since_last_flush: Duration,
+    pub total_weight: Option<usize>,
 }
 ```
 
 ### MetricsSnapshot
+
 ```rust
 pub struct MetricsSnapshot {
     pub batch_utilization_rate: f64,
     pub queue_depth: usize,
-    pub buffer_size: usize,
-    pub time_since_last_flush: Duration,
-    pub avg_execution_time: Duration,    // EMA 基准执行时间
-    pub last_execution_time: Duration,   // 最近一批执行时间
+    pub buffer_size: usize,          // 最近一次 flush 时的 batch_size（供控制器参考）
+    pub avg_execution_time: Duration,
+    pub last_execution_time: Duration,
 }
 ```
 
+> `buffer_size` 语义：指标收集器通常无法实时拿到 accumulator 内部 buffer 的当前长度，因此复用最近一次 flush 的 batch_size，作为控制器判断负载的代理指标。
+
 ### MetricsCollector
+
 ```rust
 pub trait MetricsCollector: Send + 'static {
-    async fn record_flush(&mut self, info: &FlushInfo);
+    fn record_flush(&mut self, info: &FlushInfo);
     fn snapshot(&self) -> MetricsSnapshot;
 }
 ```
 
+> 当前实现为同步方法，由主循环在合适的时机调用。若未来需要异步 IO（如写入外部时序数据库），可在此 trait 前增加 `#[async_trait]` 或 RPITIT，但会增加动态分发开销。
+
 ### WindowController
+
 ```rust
 pub trait WindowController: Send + 'static {
-    async fn adjust_window(&mut self, current: Duration, metrics: &MetricsSnapshot) -> Duration;
+    fn adjust_window(&mut self, current: Duration, metrics: &MetricsSnapshot) -> Duration;
 }
 ```
 
+> 同步方法，返回值由累加器负责 clamp 到 `[min_window, max_window]`。
+
 ## 内置控制器
 
-| 控制器 | 驱动指标 | 算法 |
-|--------|---------|------|
-| `FixedController` | 无 | 永远返回固定窗口 |
-| `AdaptiveController` | `batch_size / max_batch_size` | `factor = 1.0 + rate * (target - util)` |
-| `LatencyAdaptiveController` | `exec_time / EMA基线` | `factor = 1.0 + rate * (target - ratio)` |
-| `PIDController` | `batch_size / max_batch_size` | PID 控制算法消除稳态误差和振荡 |
-| `BackoffController` | 连续满批/空闲计数 | 满批时指数退避放大窗口，空闲时缓慢回缩 |
-| 自定义 | 任意 | 实现 `WindowController` trait |
+| 控制器 | 策略 | 适用场景 |
+|--------|------|----------|
+| `FixedController` | 永远返回固定窗口 | 不需要自适应 |
+| `AdaptiveController` | 利用率低→增大，高→缩小 | 吞吐优先 |
+| `LatencyAdaptiveController` | 执行慢→缩小，快→增大 | 延迟优先 |
+| `PIDController` | PID 算法消除稳态误差和振荡 | 精确控制 |
+| `BackoffController` | 满批指数退避，空闲缓慢回缩 | 突发流量 |
+| 自定义 | 实现 `WindowController` | 任意策略 |
 
 ### AdaptiveController
+
 - 利用率低 → 窗口增大；利用率高 → 窗口缩小
 - 无 `max_batch_size` 时 utilization = 0.0（窗口不变）
 
 ### LatencyAdaptiveController
+
 - 执行变慢 → 窗口缩小（减轻压力）；执行变快 → 窗口增大（提高吞吐）
 - 基准用 EMA 自动建立（`DefaultMetrics`）
 - 首次 flush 无基准，窗口不变
@@ -88,13 +120,31 @@ pub trait WindowController: Send + 'static {
 ## AccumulatorConfig（非泛型）
 
 ```rust
-let config = AccumulatorConfig::new(200ms, 50ms, 5s)
+let config = AccumulatorConfig::new(200ms, 50ms, 5s)?
     .with_max_batch_size(100)
     .with_max_queue_depth(10000)
-    .with_flush_empty_batches(false);
+    .with_flush_empty_batches(false)
+    .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 4 })
+    .with_max_batch_weight(1024)
+    .with_trace_per_item(false)
+    .with_drain_timeout(Some(Duration::from_secs(30)))
+    .with_drain_batch_limit(64);
 ```
 
-`build()` 从 `processor: P` 自动推断 item 类型 `T`。
+### 参数校验
+
+以下 builder 方法要求传入值 **大于 0**，否则返回 `InvalidConfig`：
+
+- `with_max_batch_size(n)`
+- `with_max_queue_depth(n)`
+- `with_max_batch_weight(n)`
+
+以下控制器构造方法也有参数范围校验：
+
+- `AdaptiveController::new(target, rate)`：`target ∈ [0.0, 1.0]`，`rate > 0`
+- `LatencyAdaptiveController::new(target, rate)`：`target > 0`，`rate > 0`
+- `PIDController::new(target, kp, ki, kd)`：`target ∈ [0.0, 1.0]`，`kp, ki, kd ≥ 0`
+- `BackoffController::new(min, max, factor)`：`factor > 0`
 
 ## AccumulatorHandle API
 
@@ -107,13 +157,24 @@ handle.send_or_wait(item, t)   // fire-and-forget + 阻塞等待
 handle.bypass(item)            // 跳过批处理
 handle.flush_now()             // 手动触发立即 flush
 handle.pending_count()         // 当前待处理数
-handle.pause()                 // 暂停 flush（继续缓冲）
+handle.pause()                 // 暂停 flush（见下方说明）
 handle.resume()                // 恢复 flush
 handle.is_paused()             // 是否已暂停
 handle.cancel()                // 触发优雅关闭
-handle.stats()                 // 统计快照（含队列等待时间）
+handle.stats()                 // 统计快照
 handle.health()                // 健康状态
 ```
+
+### pause 行为
+
+`pause()` 设置 paused 标志后：
+
+- **空批次**（timer 到期但 buffer 为空）不会 flush；
+- **非空批次**仍然会在 timer 到期、达到 `max_batch_size`、达到 `max_batch_weight` 或高优先级 item 到达时 flush；
+- `flush_now()` 仍会触发 flush；
+- `resume()` 清除 paused 标志并通知主循环检查。
+
+> 若业务需要完全暂停所有 flush（包括非空批次），需要在实现层额外控制。
 
 ## 主循环 (select! biased)
 
@@ -127,26 +188,42 @@ timer 优先：deadline 到期 → flush ← 解决 timer 饥饿
 ## 设计决策记录
 
 ### 原子队列深度
+
 `submit()` 使用 `AtomicUsize::fetch_update` 做原子 CAS 检查+递增，避免 TOCTOU 竞态。
 
 ### 负 Duration 防护
+
 所有控制器在 `Duration::from_secs_f64()` 前加 `.max(0.0)`，防止负值 panic。
 
 ### 魔数常量化
+
 EMA 平滑系数默认值定义为 `DEFAULT_EMA_ALPHA: f64 = 0.3`。
+主循环每轮非阻塞 drain 上限默认值为 `DEFAULT_DRAIN_BATCH_LIMIT: usize = 64`。
 
 ### Config 非泛型
+
 `AccumulatorConfig` 不含 `PhantomData<T>`，可跨 item 类型复用。
+
+### TryBatchProcessor 接入方式
+
+`TryBatchProcessor` 的错误类型由用户定义，无法直接参与 `BatchProcessor` 的 `Vec<R>` 返回契约。因此提供 `build_try` 入口，把错误包装进 `ReplyHandle` 的 `Result` 中返回给调用方。
 
 ## Cargo.toml 依赖
 
 ```toml
 [dependencies]
-tokio = { version = "1", features = ["time", "sync", "macros"] }
+tokio = { version = "1", features = ["time", "sync", "macros", "rt"] }
 thiserror = "2"
+tracing = { version = "0.1", default-features = false, optional = true }
+
+[features]
+default = ["tracing"]
+tracing = ["dep:tracing"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = "0.3"
+criterion = { version = "0.5", features = ["html_reports"] }
 ```
 
 ## 术语表

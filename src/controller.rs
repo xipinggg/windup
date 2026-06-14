@@ -9,11 +9,7 @@ use crate::metrics::MetricsSnapshot;
 /// 做 clamp，控制器无需自行边界检查。
 pub trait WindowController: Send + 'static {
     /// 读取指标快照，返回调整后的窗口时长（同步方法）。
-    fn adjust_window(
-        &mut self,
-        current_window: Duration,
-        metrics: &MetricsSnapshot,
-    ) -> Duration;
+    fn adjust_window(&mut self, current_window: Duration, metrics: &MetricsSnapshot) -> Duration;
 }
 
 /// 基于批利用率的自适应窗口控制器。
@@ -43,10 +39,7 @@ impl AdaptiveController {
     /// # Errors
     ///
     /// 当参数不在有效范围时返回 [`AccumulatorError::InvalidConfig`]。
-    pub fn new(
-        target_utilization: f64,
-        adjustment_rate: f64,
-    ) -> Result<Self, AccumulatorError> {
+    pub fn new(target_utilization: f64, adjustment_rate: f64) -> Result<Self, AccumulatorError> {
         if !(0.0..=1.0).contains(&target_utilization) {
             return Err(AccumulatorError::InvalidConfig {
                 reason: format!(
@@ -59,19 +52,12 @@ impl AdaptiveController {
                 reason: format!("adjustment_rate must be positive, got {adjustment_rate}"),
             });
         }
-        Ok(Self {
-            target_utilization,
-            adjustment_rate,
-        })
+        Ok(Self { target_utilization, adjustment_rate })
     }
 }
 
 impl WindowController for AdaptiveController {
-    fn adjust_window(
-        &mut self,
-        current_window: Duration,
-        metrics: &MetricsSnapshot,
-    ) -> Duration {
+    fn adjust_window(&mut self, current_window: Duration, metrics: &MetricsSnapshot) -> Duration {
         let util = metrics.batch_utilization_rate;
 
         // 空闲期或无数据：窗口不变
@@ -128,19 +114,12 @@ impl LatencyAdaptiveController {
                 reason: format!("adjustment_rate must be positive, got {adjustment_rate}"),
             });
         }
-        Ok(Self {
-            target_ratio,
-            adjustment_rate,
-        })
+        Ok(Self { target_ratio, adjustment_rate })
     }
 }
 
 impl WindowController for LatencyAdaptiveController {
-    fn adjust_window(
-        &mut self,
-        current_window: Duration,
-        metrics: &MetricsSnapshot,
-    ) -> Duration {
+    fn adjust_window(&mut self, current_window: Duration, metrics: &MetricsSnapshot) -> Duration {
         let baseline = metrics.avg_execution_time;
         let current = metrics.last_execution_time;
 
@@ -173,11 +152,7 @@ impl FixedController {
 }
 
 impl WindowController for FixedController {
-    fn adjust_window(
-        &mut self,
-        _current_window: Duration,
-        _metrics: &MetricsSnapshot,
-    ) -> Duration {
+    fn adjust_window(&mut self, _current_window: Duration, _metrics: &MetricsSnapshot) -> Duration {
         self.window
     }
 }
@@ -237,23 +212,27 @@ impl PIDController {
                 reason: format!("target must be in [0.0, 1.0], got {target}"),
             });
         }
-        Ok(Self {
-            target,
-            kp,
-            ki,
-            kd,
-            integral: 0.0,
-            prev_error: 0.0,
-        })
+        if kp < 0.0 {
+            return Err(AccumulatorError::InvalidConfig {
+                reason: format!("kp must be >= 0, got {kp}"),
+            });
+        }
+        if ki < 0.0 {
+            return Err(AccumulatorError::InvalidConfig {
+                reason: format!("ki must be >= 0, got {ki}"),
+            });
+        }
+        if kd < 0.0 {
+            return Err(AccumulatorError::InvalidConfig {
+                reason: format!("kd must be >= 0, got {kd}"),
+            });
+        }
+        Ok(Self { target, kp, ki, kd, integral: 0.0, prev_error: 0.0 })
     }
 }
 
 impl WindowController for PIDController {
-    fn adjust_window(
-        &mut self,
-        current: Duration,
-        metrics: &MetricsSnapshot,
-    ) -> Duration {
+    fn adjust_window(&mut self, current: Duration, metrics: &MetricsSnapshot) -> Duration {
         // 空闲期或无数据：窗口不变
         if metrics.batch_utilization_rate == 0.0 {
             return current;
@@ -316,23 +295,18 @@ impl BackoffController {
     /// - `max`: 最大窗口。
     /// - `factor`: 退避因子。满批时窗口乘以 factor，空闲时除以 factor。
     ///   推荐 1.5 ~ 2.0。
-    pub fn new(min: Duration, max: Duration, factor: f64) -> Self {
-        Self {
-            min_window: min,
-            max_window: max,
-            factor,
-            full_count: 0,
-            empty_count: 0,
+    pub fn new(min: Duration, max: Duration, factor: f64) -> Result<Self, AccumulatorError> {
+        if factor <= 0.0 {
+            return Err(AccumulatorError::InvalidConfig {
+                reason: format!("factor must be > 0, got {factor}"),
+            });
         }
+        Ok(Self { min_window: min, max_window: max, factor, full_count: 0, empty_count: 0 })
     }
 }
 
 impl WindowController for BackoffController {
-    fn adjust_window(
-        &mut self,
-        current: Duration,
-        metrics: &MetricsSnapshot,
-    ) -> Duration {
+    fn adjust_window(&mut self, current: Duration, metrics: &MetricsSnapshot) -> Duration {
         if metrics.batch_utilization_rate >= BACKOFF_FULL_THRESHOLD {
             // 满批：指数放大窗口
             self.full_count += 1;
@@ -411,9 +385,7 @@ mod tests {
     async fn adaptive_clamps_to_bounds() {
         let mut ctrl = ac(0.8, 0.5);
         // 极高利用率 → factor 变小但不会负
-        let new = ctrl
-            .adjust_window(Duration::from_millis(200), &snap_util(1.0))
-            ;
+        let new = ctrl.adjust_window(Duration::from_millis(200), &snap_util(1.0));
         assert!(new < Duration::from_millis(200), "high util should shrink");
     }
 
@@ -428,9 +400,7 @@ mod tests {
     #[tokio::test]
     async fn fixed_controller_always_same() {
         let mut ctrl = FixedController::new(Duration::from_millis(300));
-        let new = ctrl
-            .adjust_window(Duration::from_millis(500), &snap_util(1.0))
-            ;
+        let new = ctrl.adjust_window(Duration::from_millis(500), &snap_util(1.0));
         assert_eq!(new, Duration::from_millis(300));
     }
 
@@ -482,9 +452,7 @@ mod tests {
     async fn latency_clamped_to_bounds() {
         let mut ctrl = lc(1.0, 0.5);
         let snap = snap_latency(Duration::from_millis(100), Duration::from_millis(300));
-        let new = ctrl
-            .adjust_window(Duration::from_millis(200), &snap)
-            ;
+        let new = ctrl.adjust_window(Duration::from_millis(200), &snap);
         assert!(new < Duration::from_millis(200));
     }
 
@@ -542,8 +510,10 @@ mod tests {
         let delta1 = snap1.as_millis() as i64 - current.as_millis() as i64;
         let delta2 = snap2.as_millis() as i64 - current.as_millis() as i64;
         let delta3 = snap3.as_millis() as i64 - current.as_millis() as i64;
-        assert!(delta3 > delta1,
-            "PID integral should build up: delta1={delta1}, delta2={delta2}, delta3={delta3}");
+        assert!(
+            delta3 > delta1,
+            "PID integral should build up: delta1={delta1}, delta2={delta2}, delta3={delta3}"
+        );
     }
 
     #[tokio::test]
@@ -572,16 +542,12 @@ mod tests {
     // ─── Backoff 控制器测试 ───
 
     fn bo(min: Duration, max: Duration, factor: f64) -> BackoffController {
-        BackoffController::new(min, max, factor)
+        BackoffController::new(min, max, factor).unwrap()
     }
 
     #[tokio::test]
     async fn backoff_full_batch_grows_window() {
-        let mut ctrl = bo(
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            2.0,
-        );
+        let mut ctrl = bo(Duration::from_millis(100), Duration::from_secs(10), 2.0);
         let current = Duration::from_millis(200);
         let new = ctrl.adjust_window(current, &snap_util(0.98));
         assert!(new > current, "full batch should grow window, got {new:?}");
@@ -590,11 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn backoff_consecutive_full_exponential() {
-        let mut ctrl = bo(
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            2.0,
-        );
+        let mut ctrl = bo(Duration::from_millis(100), Duration::from_secs(10), 2.0);
         let current = Duration::from_millis(200);
 
         // 第一次满批：200 * 2^1 = 400
@@ -612,11 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn backoff_idle_shrinks_after_consecutive() {
-        let mut ctrl = bo(
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            2.0,
-        );
+        let mut ctrl = bo(Duration::from_millis(100), Duration::from_secs(10), 2.0);
         let current = Duration::from_millis(400);
         let idle_snap = snap_with_queue(0.0, 0);
 
@@ -634,11 +592,7 @@ mod tests {
     #[tokio::test]
     async fn backoff_idle_with_queue_depth_does_not_shrink() {
         // 队列中有待处理项时不算真正的空闲
-        let mut ctrl = bo(
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            2.0,
-        );
+        let mut ctrl = bo(Duration::from_millis(100), Duration::from_secs(10), 2.0);
         let current = Duration::from_millis(400);
         let snap = snap_with_queue(0.0, 5); // queue_depth > 0
 
@@ -650,11 +604,7 @@ mod tests {
 
     #[tokio::test]
     async fn backoff_normal_utilization_resets_counters() {
-        let mut ctrl = bo(
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            2.0,
-        );
+        let mut ctrl = bo(Duration::from_millis(100), Duration::from_secs(10), 2.0);
         let current = Duration::from_millis(200);
 
         // 先积累 2 次满批
@@ -667,17 +617,12 @@ mod tests {
 
         // 再满批，从头计数
         let w2 = ctrl.adjust_window(current, &snap_util(0.99));
-        assert_eq!(w2, Duration::from_millis(400),
-            "after reset, full count should restart at 1");
+        assert_eq!(w2, Duration::from_millis(400), "after reset, full count should restart at 1");
     }
 
     #[tokio::test]
     async fn backoff_clamped_to_bounds() {
-        let mut ctrl = bo(
-            Duration::from_millis(100),
-            Duration::from_millis(1000),
-            3.0,
-        );
+        let mut ctrl = bo(Duration::from_millis(100), Duration::from_millis(1000), 3.0);
         let current = Duration::from_millis(500);
 
         // 多次满批，应被 max_window 限制
@@ -686,31 +631,21 @@ mod tests {
         }
         // 不会超过 max_window
         let w = ctrl.adjust_window(current, &snap_util(0.99));
-        assert!(w <= Duration::from_millis(1000),
-            "should clamp to max_window, got {w:?}");
+        assert!(w <= Duration::from_millis(1000), "should clamp to max_window, got {w:?}");
 
         // 从极小窗口开始多次空闲，应被 min_window 限制
-        let mut ctrl2 = bo(
-            Duration::from_millis(50),
-            Duration::from_secs(10),
-            4.0,
-        );
+        let mut ctrl2 = bo(Duration::from_millis(50), Duration::from_secs(10), 4.0);
         let small = Duration::from_millis(60);
         for _ in 0..10 {
             ctrl2.adjust_window(small, &snap_with_queue(0.0, 0));
         }
         let w2 = ctrl2.adjust_window(small, &snap_with_queue(0.0, 0));
-        assert!(w2 >= Duration::from_millis(50),
-            "should clamp to min_window, got {w2:?}");
+        assert!(w2 >= Duration::from_millis(50), "should clamp to min_window, got {w2:?}");
     }
 
     #[tokio::test]
     async fn backoff_full_then_idle_resets_full_counter() {
-        let mut ctrl = bo(
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            2.0,
-        );
+        let mut ctrl = bo(Duration::from_millis(100), Duration::from_secs(10), 2.0);
         let current = Duration::from_millis(200);
 
         // 满批 2 次
@@ -723,7 +658,6 @@ mod tests {
 
         // 再满批 -> 从头计数
         let w2 = ctrl.adjust_window(current, &snap_util(0.99));
-        assert_eq!(w2, Duration::from_millis(400),
-            "full after idle reset should restart at 1");
+        assert_eq!(w2, Duration::from_millis(400), "full after idle reset should restart at 1");
     }
 }

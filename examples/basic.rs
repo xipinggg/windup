@@ -28,11 +28,7 @@ impl BatchProcessor<String, String> for UpperProcessor {
         // 模拟下游处理耗时
         tokio::time::sleep(Duration::from_millis(n as u64 * 5)).await;
         // 返回处理结果
-        batch
-            .into_inner()
-            .into_iter()
-            .map(|s| s.to_uppercase())
-            .collect()
+        batch.into_inner().into_iter().map(|s| s.to_uppercase()).collect()
     }
 }
 
@@ -47,21 +43,19 @@ async fn main() {
     .with_max_batch_size(20)
     .with_concurrency_mode(ConcurrencyMode::Concurrent { max_inflight: 4 });
 
-    let (handle, accumulator) = config.build(
-        UpperProcessor {
-            total: AtomicUsize::new(0),
-        },
-        DefaultMetrics::new(),
-        AdaptiveController::new(0.8, 0.1).unwrap(),
-    );
+    let (handle, accumulator) = config
+        .build(
+            UpperProcessor { total: AtomicUsize::new(0) },
+            DefaultMetrics::new(),
+            AdaptiveController::new(0.8, 0.1).unwrap(),
+        )
+        .unwrap();
 
     let _jh = tokio::spawn(accumulator.run());
 
     // 场景1: reply — 提交并等待结果
     println!("=== 场景1: submit_with_reply ===");
-    let reply = handle
-        .submit("hello-world".into())
-        .unwrap();
+    let reply = handle.submit("hello-world".into()).unwrap();
     let result = reply.await.unwrap();
     println!("  结果: {result}");
 
@@ -70,9 +64,7 @@ async fn main() {
     for i in 1..=5 {
         handle.send(format!("fire-{i}")).unwrap();
     }
-    let reply2 = handle
-        .submit("mixed-reply".into())
-        .unwrap();
+    let reply2 = handle.submit("mixed-reply".into()).unwrap();
     println!("  结果: {}", reply2.await.unwrap());
 
     // 场景3: bypass（不支持 reply）
@@ -85,9 +77,7 @@ async fn main() {
     for i in 0..5 {
         let h = handle.clone();
         handles.push(tokio::spawn(async move {
-            let reply = h
-                .submit(format!("task-{i}"))
-                .unwrap();
+            let reply = h.submit(format!("task-{i}")).unwrap();
             let result = reply.await.unwrap();
             println!("  task-{i} 结果: {result}");
         }));

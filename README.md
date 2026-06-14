@@ -34,7 +34,7 @@ async fn main() {
         MyProcessor,
         DefaultMetrics::new(),
         AdaptiveController::new(0.8, 0.1)?,
-    );
+    )?;
 
     let reply = handle.submit(42)?;
     let result = reply.await?; // "处理批次 #0: 1 条"
@@ -152,7 +152,7 @@ println!("接受中: {}, 队列利用率: {:.1}%, 拒绝: {}",
 ### 运行控制
 
 ```rust
-handle.pause();                   // 暂停 flush（继续缓冲）
+handle.pause();                   // 暂停空批次 flush（继续缓冲，非空批次仍按规则 flush）
 handle.resume();                  // 恢复 flush
 assert!(handle.is_paused());      // 检查暂停状态
 handle.cancel();                  // 触发优雅关闭
@@ -185,7 +185,7 @@ tokio = { version = "1", features = ["full"] }
 `tracing` feature 默认开启。如需关闭：
 
 ```toml
-draft = { version = "0.1", default-features = false }
+windup = { version = "0.1", default-features = false }
 ```
 
 ## 项目结构

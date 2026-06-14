@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
@@ -13,9 +13,9 @@ use crate::controller::WindowController;
 use crate::error::AccumulatorError;
 use crate::metrics::MetricsCollector;
 use crate::stats::{AccumulatorStats, StatsSnapshot};
-use crate::trace::event_at;
 #[cfg_attr(not(feature = "tracing"), allow(unused_imports))]
 use crate::trace::Level;
+use crate::trace::event_at;
 
 use std::collections::VecDeque;
 
@@ -134,29 +134,48 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
     ) -> Result<(), AccumulatorError> {
         self.acquire_slot()?;
         self.sender
-            .send(ChannelItem { value, deadline, reply, priority, parent_span: crate::trace::current_span(), submitted_at: Instant::now() })
-            .map_err(|_| { self.pending_count.fetch_sub(1, Ordering::Release); AccumulatorError::Shutdown })?;
+            .send(ChannelItem {
+                value,
+                deadline,
+                reply,
+                priority,
+                parent_span: crate::trace::current_span(),
+                submitted_at: Instant::now(),
+            })
+            .map_err(|_| {
+                self.pending_count.fetch_sub(1, Ordering::Release);
+                AccumulatorError::Shutdown
+            })?;
         self.stats.record_submit();
         Ok(())
     }
 
-    /// 阻塞提交/发送的核心循环。`with_reply=true` 返回 ReplyHandle。
-    async fn blocking_inner(
-        &self, item: T, timeout: Duration, with_reply: bool,
-    ) -> Result<Option<ReplyHandle<R>>, AccumulatorError> {
+    /// 阻塞提交：队列满时等待空位，超时则返回错误。
+    async fn blocking_submit(
+        &self,
+        item: T,
+        timeout: Duration,
+    ) -> Result<ReplyHandle<R>, AccumulatorError> {
         loop {
             match self.acquire_slot() {
                 Ok(()) => {
-                    let (tx, reply) = if with_reply {
-                        let (tx, rx) = tokio::sync::oneshot::channel();
-                        (Some(tx), Some(ReplyHandle::new(rx)))
-                    } else { (None, None) };
+                    let (tx, rx) = tokio::sync::oneshot::channel();
                     match self.sender.send(ChannelItem {
-                        value: item, deadline: None, reply: tx,
-                        priority: Priority::Normal, parent_span: crate::trace::current_span(), submitted_at: Instant::now(),
+                        value: item,
+                        deadline: None,
+                        reply: Some(tx),
+                        priority: Priority::Normal,
+                        parent_span: crate::trace::current_span(),
+                        submitted_at: Instant::now(),
                     }) {
-                        Ok(()) => { self.stats.record_submit(); return Ok(reply); }
-                        Err(_) => { self.pending_count.fetch_sub(1, Ordering::Release); return Err(AccumulatorError::Shutdown); }
+                        Ok(()) => {
+                            self.stats.record_submit();
+                            return Ok(ReplyHandle::new(rx));
+                        }
+                        Err(_) => {
+                            self.pending_count.fetch_sub(1, Ordering::Release);
+                            return Err(AccumulatorError::Shutdown);
+                        }
                     }
                 }
                 Err(AccumulatorError::QueueFull { .. }) => {
@@ -164,7 +183,46 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
                         _ = self.queue_notify.notified() => true,
                         _ = tokio::time::sleep(timeout) => false,
                     };
-                    if !notified { return Err(AccumulatorError::Timeout); }
+                    if !notified {
+                        return Err(AccumulatorError::Timeout);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// 阻塞发送（fire-and-forget）：队列满时等待空位，超时则返回错误。
+    async fn blocking_send(&self, item: T, timeout: Duration) -> Result<(), AccumulatorError> {
+        loop {
+            match self.acquire_slot() {
+                Ok(()) => {
+                    match self.sender.send(ChannelItem {
+                        value: item,
+                        deadline: None,
+                        reply: None,
+                        priority: Priority::Normal,
+                        parent_span: crate::trace::current_span(),
+                        submitted_at: Instant::now(),
+                    }) {
+                        Ok(()) => {
+                            self.stats.record_submit();
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            self.pending_count.fetch_sub(1, Ordering::Release);
+                            return Err(AccumulatorError::Shutdown);
+                        }
+                    }
+                }
+                Err(AccumulatorError::QueueFull { .. }) => {
+                    let notified = tokio::select! {
+                        _ = self.queue_notify.notified() => true,
+                        _ = tokio::time::sleep(timeout) => false,
+                    };
+                    if !notified {
+                        return Err(AccumulatorError::Timeout);
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -281,9 +339,11 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
         self.flush_notify.notify_one();
     }
 
-    /// 暂停累加器：继续接收 item 但不触发 flush。
+    /// 暂停累加器：继续接收 item，但空批次不触发 flush。
     ///
-    /// timer 到期、达到 max_batch_size 等均被抑制。高优先级 item 仍会触发 flush。
+    /// 设置 paused 标志后，buffer 为空时 timer 到期不会 flush；
+    /// 非空 buffer 仍会在 timer 到期、达到 `max_batch_size`、达到
+    /// `max_batch_weight` 或高优先级 item 到达时 flush。
     /// 用于速率限制或优雅降级场景。
     pub fn pause(&self) {
         self.shared.paused.store(true, Ordering::Release);
@@ -311,9 +371,7 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
     ///
     /// - [`AccumulatorError::Shutdown`]：累加器已关闭。
     pub fn bypass(&self, item: T) -> Result<(), AccumulatorError> {
-        self.bypass_sender
-            .send(vec![item])
-            .map_err(|_| AccumulatorError::Shutdown)?;
+        self.bypass_sender.send(vec![item]).map_err(|_| AccumulatorError::Shutdown)?;
         self.stats.record_bypass();
         Ok(())
     }
@@ -325,7 +383,9 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
     /// - [`AccumulatorError::QueueFull`]：超过 `max_queue_depth` 限制。
     /// - [`AccumulatorError::Shutdown`]：累加器已关闭。
     pub fn submit_with(
-        &self, item: T, opts: SubmitOptions,
+        &self,
+        item: T,
+        opts: SubmitOptions,
     ) -> Result<ReplyHandle<R>, AccumulatorError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let deadline = opts.ttl.map(|ttl| Instant::now() + ttl);
@@ -339,11 +399,11 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
     /// - [`AccumulatorError::Timeout`]：等待超时。
     /// - [`AccumulatorError::Shutdown`]：累加器已关闭。
     pub async fn submit_or_wait(
-        &self, item: T, timeout: Duration,
+        &self,
+        item: T,
+        timeout: Duration,
     ) -> Result<ReplyHandle<R>, AccumulatorError> {
-        self.blocking_inner(item, timeout, true)
-            .await
-            .map(|opt| opt.unwrap_or_else(|| unreachable!("blocking_inner(true) always returns Some")))
+        self.blocking_submit(item, timeout).await
     }
 
     /// 阻塞发送（fire-and-forget + 阻塞等待）：队列满时等待空位。
@@ -351,10 +411,8 @@ impl<T: Send, R: Send> AccumulatorHandle<T, R> {
     /// # Errors
     /// - [`AccumulatorError::Timeout`]：等待超时。
     /// - [`AccumulatorError::Shutdown`]：累加器已关闭。
-    pub async fn send_or_wait(
-        &self, item: T, timeout: Duration,
-    ) -> Result<(), AccumulatorError> {
-        self.blocking_inner(item, timeout, false).await.map(|_| ())
+    pub async fn send_or_wait(&self, item: T, timeout: Duration) -> Result<(), AccumulatorError> {
+        self.blocking_send(item, timeout).await
     }
 }
 
@@ -429,11 +487,7 @@ where
         // Enter span for startup event — dropped before first await
         {
             let _run_guard = run_span.clone().entered();
-            event_at!(
-                Level::INFO,
-                &self.config.tracing_level,
-                "累加器启动"
-            );
+            event_at!(Level::INFO, &self.config.tracing_level, "累加器启动");
         }
 
         let mut deadline = Instant::now() + self.current_window();
@@ -550,22 +604,26 @@ where
         // Enter span for shutdown event（无后续 await）
         {
             let _run_guard = run_span.entered();
-            event_at!(
-                Level::INFO,
-                &self.config.tracing_level,
-                "累加器关闭"
-            );
+            event_at!(Level::INFO, &self.config.tracing_level, "累加器关闭");
         }
     }
 
     // ─── private methods ───
 
-    /// 清空 buffer 并解构为 (items, senders, parent_spans, batch_id, batch_span, total_weight)。
+    /// 清空 buffer 并解构为 (items, senders, parent_spans, batch_id, batch_span, total_weight, queue_depth)。
     /// flush_inner 和 spawn_flush 共享此逻辑（约 35 行重复代码）。
     #[allow(clippy::type_complexity)]
     fn drain_buffer_items(
         &mut self,
-    ) -> (Vec<T>, Vec<ReplySender<R>>, Vec<crate::trace::MaybeSpan>, u64, crate::trace::MaybeSpan, usize) {
+    ) -> (
+        Vec<T>,
+        Vec<ReplySender<R>>,
+        Vec<crate::trace::MaybeSpan>,
+        u64,
+        crate::trace::MaybeSpan,
+        usize,
+        usize,
+    ) {
         let buffer_items: Vec<ChannelItem<T, R>> = self.buffer.drain(..).collect();
         let total_weight = self.current_weight;
         self.current_weight = 0;
@@ -576,12 +634,17 @@ where
         let batch_id = self.next_batch_id;
         self.next_batch_id += 1;
         let queue_depth = self.pending_count.load(Ordering::Acquire);
-        let batch_span = crate::trace::batch_span(batch_id, buffer_items.len(), self.current_window(), queue_depth);
+        let batch_span = crate::trace::batch_span(
+            batch_id,
+            buffer_items.len(),
+            self.current_window(),
+            queue_depth,
+        );
 
         let (items, senders): (Vec<T>, Vec<ReplySender<R>>) =
             buffer_items.into_iter().map(|bi| (bi.value, bi.reply)).unzip();
 
-        (items, senders, parent_spans, batch_id, batch_span, total_weight)
+        (items, senders, parent_spans, batch_id, batch_span, total_weight, queue_depth)
     }
 
     /// 窗口调整：快照 metrics → controller → clamp → 日志 → 写入共享状态。
@@ -590,16 +653,24 @@ where
         let new_window = self.controller.adjust_window(self.current_window(), &snapshot);
         let clamped = new_window.clamp(self.config.min_window, self.config.max_window);
         if clamped != self.current_window() {
-            event_at!(Level::INFO, &self.config.tracing_level,
+            event_at!(
+                Level::INFO,
+                &self.config.tracing_level,
                 prev_ms = self.current_window().as_millis() as u64,
-                new_ms = clamped.as_millis() as u64, "窗口调整");
+                new_ms = clamped.as_millis() as u64,
+                "窗口调整"
+            );
         }
         self.set_current_window(clamped);
     }
 
     /// 通过 spawn 隔离 processor panic。panic 时记录错误并返回空 Vec。
     #[allow(unused_variables)]
-    async fn process_safe(tracing_level: crate::trace::TraceLevel, processor: Arc<P>, batch: Batch<T>) -> Vec<R> {
+    async fn process_safe(
+        tracing_level: crate::trace::TraceLevel,
+        processor: Arc<P>,
+        batch: Batch<T>,
+    ) -> Vec<R> {
         let handle = tokio::spawn(async move { processor.process(batch).await });
         match handle.await {
             Ok(results) => results,
@@ -658,17 +729,17 @@ where
                     let batch = Batch::with_context(items, batch_id, Duration::ZERO, 0);
                     self.processor.process(batch).await;
                 } else {
-                    self.spawn_bypass(items);
+                    self.spawn_bypass(items, batch_id);
                 }
             }
         }
     }
 
     /// 并发模式：在后台 task 中处理 bypass 批次。
+    ///
+    /// `batch_id` 由调用方分配（通过 `self.next_batch_id`），确保 bypass 编号连续。
     #[allow(clippy::let_unit_value)]
-    fn spawn_bypass(&mut self, items: Vec<T>) {
-        let batch_id = self.next_batch_id;
-        self.next_batch_id += 1;
+    fn spawn_bypass(&mut self, items: Vec<T>, batch_id: u64) {
         let item_count = items.len();
         let _tracing_level = self.config.tracing_level;
         let bypass_span = crate::trace::bypass_span(batch_id, item_count);
@@ -712,12 +783,13 @@ where
     /// 并发模式：在后台 task 中处理批次。
     #[allow(clippy::let_unit_value)]
     fn spawn_flush(&mut self, time_since_last_flush: Duration) {
-        let (items, senders, parent_spans, batch_id, batch_span, total_weight) = self.drain_buffer_items();
+        let (items, senders, parent_spans, batch_id, batch_span, total_weight, queue_depth) =
+            self.drain_buffer_items();
         let batch_size = items.len();
 
         let _tracing_level = self.config.tracing_level;
         let trace_per_item = self.config.trace_per_item;
-        let batch = Batch::with_context(items, batch_id, self.current_window(), 0);
+        let batch = Batch::with_context(items, batch_id, self.current_window(), queue_depth);
         let processor = Arc::clone(&self.processor);
         let feedback_tx = self.feedback_tx.clone();
         let pending_count = Arc::clone(&self.pending_count);
@@ -758,11 +830,7 @@ where
                 );
 
                 // 逐个发送结果 + per-item span
-                for (index, (sender, result)) in senders
-                    .into_iter()
-                    .zip(results)
-                    .enumerate()
-                {
+                for (index, (sender, result)) in senders.into_iter().zip(results).enumerate() {
                     let _item_guard = if trace_per_item {
                         let span = crate::trace::item_span(index);
                         if index < parent_spans.len() {
@@ -812,11 +880,14 @@ where
     ///
     /// 返回 `true` 表示已执行 flush（或空批次跳过），`false` 表示并发满被跳过。
     async fn flush_batch(&mut self) -> bool {
-        // paused 时跳过 timer 触发的空批次，但允许手动 flush
+        // paused 时跳过 timer 触发的空批次，但允许手动 flush。
+        // paused 时空批次不更新 last_flush_time，防止暂停期间的时间间隔被错误清零。
         if self.buffer.is_empty()
             && (!self.config.flush_empty_batches || self.shared.paused.load(Ordering::Acquire))
         {
-            self.last_flush_time = Instant::now();
+            if !self.shared.paused.load(Ordering::Acquire) {
+                self.last_flush_time = Instant::now();
+            }
             return true;
         }
 
@@ -853,17 +924,25 @@ where
     /// flush 内核心逻辑（串行模式）：处理 buffer → FlushInfo → 记录指标。
     #[allow(clippy::unit_arg)]
     async fn flush_inner(&mut self, time_since_last_flush: Duration) {
-        let (items, senders, parent_spans, batch_id, batch_span, total_weight) = self.drain_buffer_items();
+        let (items, senders, parent_spans, batch_id, batch_span, total_weight, queue_depth) =
+            self.drain_buffer_items();
         let batch_size = items.len();
 
         {
             let _batch_guard = batch_span.clone().entered();
-            event_at!(Level::INFO, &self.config.tracing_level, batch_id, batch_size, "批次处理开始");
+            event_at!(
+                Level::INFO,
+                &self.config.tracing_level,
+                batch_id,
+                batch_size,
+                "批次处理开始"
+            );
         }
 
-        let batch = Batch::with_context(items, batch_id, self.current_window(), 0);
+        let batch = Batch::with_context(items, batch_id, self.current_window(), queue_depth);
         let proc_start = Instant::now();
-        let results = Self::process_safe(self.config.tracing_level, Arc::clone(&self.processor), batch).await;
+        let results =
+            Self::process_safe(self.config.tracing_level, Arc::clone(&self.processor), batch).await;
         let execution_time = proc_start.elapsed();
 
         // 长度校验：processor 约定返回与 batch 等长的结果
@@ -880,24 +959,28 @@ where
             let _batch_guard = batch_span.entered();
 
             for (index, (sender, result)) in senders.into_iter().zip(results).enumerate() {
-            let _item_guard = if self.config.trace_per_item {
-                let span = crate::trace::item_span(index);
-                if index < parent_spans.len() { span.follows_from(parent_spans[index].clone()); }
-                Some(span.entered())
-            } else { None };
-            Self::send_reply(Ok(result), sender);
-        }
+                let _item_guard = if self.config.trace_per_item {
+                    let span = crate::trace::item_span(index);
+                    if index < parent_spans.len() {
+                        span.follows_from(parent_spans[index].clone());
+                    }
+                    Some(span.entered())
+                } else {
+                    None
+                };
+                Self::send_reply(Ok(result), sender);
+            }
 
-        event_at!(
-            Level::INFO,
-            &self.config.tracing_level,
-            batch_id = batch_id,
-            batch_size = batch_size,
-            execution_time_ms = execution_time.as_millis() as u64,
-            items_remaining = items_remaining,
-            window_ms = self.current_window().as_millis() as u64,
-            "批次处理完成"
-        );
+            event_at!(
+                Level::INFO,
+                &self.config.tracing_level,
+                batch_id = batch_id,
+                batch_size = batch_size,
+                execution_time_ms = execution_time.as_millis() as u64,
+                items_remaining = items_remaining,
+                window_ms = self.current_window().as_millis() as u64,
+                "批次处理完成"
+            );
         }
 
         let info = FlushInfo {
@@ -941,9 +1024,8 @@ where
             let expired = item.deadline.is_some_and(|d| now >= d);
             if expired {
                 Self::send_reply(Err(AccumulatorError::Timeout), item.reply.take());
-                self.current_weight = self
-                    .current_weight
-                    .saturating_sub((self.weight_fn)(&item.value));
+                self.current_weight =
+                    self.current_weight.saturating_sub((self.weight_fn)(&item.value));
                 dropped_count += 1;
             } else {
                 kept.push_back(item);
@@ -1001,21 +1083,20 @@ where
 
             // 跳过已过期 item
             if let Some(dl) = ch.deadline
-                && Instant::now() >= dl {
-                    Self::send_reply(Err(AccumulatorError::Timeout), ch.reply.take());
-                    self.stats.record_dropped_timeout(1);
-                    event_at!(
-                        Level::WARN,
-                        &self.config.tracing_level,
-                        dropped = 1u64,
-                        "drain 阶段 item 超时丢弃"
-                    );
-                    continue;
-                }
+                && Instant::now() >= dl
+            {
+                Self::send_reply(Err(AccumulatorError::Timeout), ch.reply.take());
+                self.stats.record_dropped_timeout(1);
+                event_at!(
+                    Level::WARN,
+                    &self.config.tracing_level,
+                    dropped = 1u64,
+                    "drain 阶段 item 超时丢弃"
+                );
+                continue;
+            }
 
-            self.current_weight = self
-                .current_weight
-                .saturating_add((self.weight_fn)(&ch.value));
+            self.current_weight = self.current_weight.saturating_add((self.weight_fn)(&ch.value));
 
             self.buffer.push_back(ChannelItem {
                 value: ch.value,
@@ -1042,7 +1123,9 @@ where
             ConcurrencyMode::Concurrent { .. } => {
                 // 清空 bypass 通道（并发处理）
                 while let Ok(items) = self.bypass_rx.try_recv() {
-                    self.spawn_bypass(items);
+                    let batch_id = self.next_batch_id;
+                    self.next_batch_id += 1;
+                    self.spawn_bypass(items, batch_id);
                 }
                 // 处理 buffer 最后一批（并发处理）
                 if !self.buffer.is_empty() || self.config.flush_empty_batches {

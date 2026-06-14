@@ -29,7 +29,7 @@
 //!     MyProcessor,
 //!     DefaultMetrics::new(),
 //!     AdaptiveController::new(0.8, 0.1)?,
-//! );
+//! )?;
 //!
 //! let reply = handle.submit(42)?;
 //! let result = reply.await?;  // 拿到处理结果
@@ -98,17 +98,15 @@ pub mod trace;
 pub mod prelude {
     pub use crate::accumulator::AccumulatorHandle;
     pub use crate::batch::{
-        Batch, BatchProcessor, FlushInfo, Priority, ReplyHandle, SubmitOptions,
+        Batch, BatchProcessor, FlushInfo, Priority, ReplyHandle, SubmitOptions, TryBatchAdapter,
         TryBatchProcessor,
     };
     pub use crate::config::{AccumulatorConfig, ConcurrencyMode};
     pub use crate::controller::{
-        AdaptiveController, BackoffController, FixedController,
-        LatencyAdaptiveController, PIDController, WindowController,
+        AdaptiveController, BackoffController, FixedController, LatencyAdaptiveController,
+        PIDController, WindowController,
     };
     pub use crate::error::AccumulatorError;
-    pub use crate::metrics::{
-        DefaultMetrics, MetricsCollector, MetricsSnapshot,
-    };
+    pub use crate::metrics::{DefaultMetrics, MetricsCollector, MetricsSnapshot};
     pub use crate::stats::{AccumulatorHealth, StatsSnapshot};
 }
